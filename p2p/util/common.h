@@ -1,9 +1,23 @@
 #ifndef COMMON_H
 #define COMMON_H
 
-#include <arpa/inet.h>
+// Keep this header installable: it must stay self-contained without
+// project-relative includes. transport/config.h owns the canonical macro;
+// the build always passes -DUCCL_P2P_ENABLE_RDMA explicitly, so the
+// fallback here only covers stale external consumers of the installed copy.
+#ifndef UCCL_P2P_ENABLE_RDMA
+#define UCCL_P2P_ENABLE_RDMA 1
+#endif
+
+#if UCCL_P2P_ENABLE_RDMA
 #include <infiniband/efadv.h>
 #include <infiniband/verbs.h>
+#else
+// Shared engine types (MRArray, Mhandle) only hold pointers to MRs; a forward
+// declaration keeps them compiling without libibverbs headers.
+struct ibv_mr;
+#endif
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <algorithm>
 #include <atomic>
@@ -156,6 +170,13 @@ using CompressCtx = std::shared_ptr<CompressionContext>;
 
 enum class NicMode { EFA, IB };
 
+// Set on a thread by batching writev/readv paths: RDMADataChannel::submit_request
+// accumulates send requests in a per-channel batch instead of posting them
+// immediately; the caller flushes via RDMAEndpoint::flush_all_sends(). Declared
+// here (not in rdma_data_channel.h) so engine code compiles without the RDMA
+// transport, where it is harmlessly set and never read.
+inline thread_local bool g_uccl_batch_post = false;
+
 static constexpr uint8_t kPortNum = 1;
 static constexpr int kNumEngines = 4;
 static constexpr int kNumGpuRtStreams = 4;
@@ -254,6 +275,17 @@ struct ContextArrayT {
 using RKeyArray = ContextArrayT<uint32_t>;
 using MRArray = ContextArrayT<struct ibv_mr*>;
 
+// Handle over an MR pinned in RdmaContext's registration cache. The cache
+// itself (MrCacheEntry, RdmaContext) is defined in rdma/rdma_context.h and
+// exists only in RDMA builds; the handle type itself is part of the shared
+// P2PMhandle layout, so it lives here with forward declarations.
+class RdmaContext;
+struct MrCacheEntry;
+struct MrCacheHandleRef {
+  std::shared_ptr<RdmaContext> context;
+  MrCacheEntry* entry = nullptr;
+};
+
 // ImmData class: encapsulates immediate data with chunk_count (high 16 bits)
 // and index (low 16 bits)
 class ImmData {
@@ -342,6 +374,7 @@ struct ChunkSplitStrategy {
   static size_t get_regular_chunk_size(size_t message_size, size_t chunk_count);
 };
 
+#if UCCL_P2P_ENABLE_RDMA
 struct ChannelMetaData {
   uint32_t qpn;
   union ibv_gid gid;  // RoCE
@@ -358,6 +391,7 @@ void copy_rkey_array_from_mr_array(MRArray const& mr_array,
 
 void copy_rkeys_from_mr_array_to_bytes(MRArray const& mr_array, char* dst,
                                        size_t dst_size);
+#endif
 
 struct OOBMetaData {
   std::string server_ip;
@@ -368,6 +402,7 @@ struct OOBMetaData {
   friend std::ostream& operator<<(std::ostream& os, OOBMetaData const& meta);
 };
 
+#if UCCL_P2P_ENABLE_RDMA
 struct CQMeta {
   uint64_t wr_id;
   ibv_wc_opcode op_code;
@@ -377,6 +412,7 @@ struct CQMeta {
 
   friend std::ostream& operator<<(std::ostream& os, CQMeta const& meta);
 };
+#endif
 
 // Registered memory region info
 typedef struct RegMemBlock {
@@ -405,6 +441,7 @@ typedef struct RegMemBlock {
   // Get MR by context ID
   struct ibv_mr* get_mr_by_context_id(uint32_t context_id) const;
 
+#if UCCL_P2P_ENABLE_RDMA
   // Get rkey by channel ID (for remote RDMA access)
   uint32_t get_rkey_by_channel_id(uint32_t channel_id) const;
 
@@ -416,6 +453,7 @@ typedef struct RegMemBlock {
 
   // Get lkey by context ID (for local SGE access)
   uint32_t get_lkey_by_context_id(uint32_t context_id) const;
+#endif
 
   friend std::ostream& operator<<(std::ostream& os, RegMemBlock const& block);
 } RegMemBlock;
@@ -428,11 +466,13 @@ typedef struct RemoteMemInfo {
   RemoteMemInfo();
 
   RemoteMemInfo(uint64_t a, size_t len, RKeyArray const& rkey, MemoryType t);
+#if UCCL_P2P_ENABLE_RDMA
   RemoteMemInfo(uint64_t a, size_t len, MRArray const& mrs, MemoryType t);
 
   RemoteMemInfo(RegMemBlock const& block);
 
   RemoteMemInfo(std::shared_ptr<RegMemBlock> const block);
+#endif
 
   // Remote memory only carries rkeys (lkey stays local to the owner).
   uint32_t get_rkey_by_channel_id(uint32_t channel_id) const;
@@ -507,9 +547,11 @@ struct RDMASendRequest {
                   bool signaled = true);
 
   // Getter methods
+#if UCCL_P2P_ENABLE_RDMA
   uint32_t get_local_key() const;
 
   uint32_t get_remote_key() const;
+#endif
 
   uint64_t get_local_address() const;
 
@@ -537,6 +579,7 @@ T deserialize(std::string const& s) {
   return obj;
 }
 
+#if UCCL_P2P_ENABLE_RDMA
 // Example MetaInfo struct for metadata exchange
 struct MetaInfoToExchange {
   int32_t peer_id;
@@ -566,6 +609,7 @@ struct MetaInfoToExchange {
   friend std::ostream& operator<<(std::ostream& os,
                                   MetaInfoToExchange const& meta);
 };
+#endif
 
 // Helper function: make socket non-blocking
 int make_socket_non_blocking(int fd);
@@ -573,7 +617,9 @@ int make_socket_non_blocking(int fd);
 // Helper function: try send entire buffer, return bytes_sent
 ssize_t try_send(int fd, char const* buf, size_t len);
 
+#if UCCL_P2P_ENABLE_RDMA
 bool is_nic_usable(std::string const& nic_name, NicMode mode);
+#endif
 
 // Hash support for RegMemBlock (based on size and type only)
 namespace std {

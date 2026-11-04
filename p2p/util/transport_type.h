@@ -11,7 +11,7 @@ enum class TransportType { RDMA, NCCL, EFA, CXI };
 inline bool transport_available(TransportType type) {
   switch (type) {
     case TransportType::RDMA:
-      return true;
+      return UCCL_P2P_ENABLE_RDMA;
     case TransportType::NCCL:
       return UCCL_P2P_ENABLE_NCCL;
     case TransportType::EFA:
@@ -32,7 +32,9 @@ inline TransportType get_transport_type() {
           std::string(uccl::device::Backend::name) +
           " P2P supports only UCCL_P2P_TRANSPORT=rdma/ib (including IPC)");
     TransportType selected = TransportType::RDMA;
+    char const* label = "rdma (default)";
     if (env) {
+      label = env;
       if (std::strcmp(env, "nccl") == 0 || std::strcmp(env, "tcp") == 0 ||
           std::strcmp(env, "tcpx") == 0)
         selected = TransportType::NCCL;
@@ -40,9 +42,19 @@ inline TransportType get_transport_type() {
         selected = TransportType::EFA;
       else if (std::strcmp(env, "cxi") == 0)
         selected = TransportType::CXI;
+    } else if (!transport_available(TransportType::RDMA)) {
+      // No explicit choice in a build without the verbs data plane: default
+      // to the first compiled-in transport instead of failing to start.
+      if (transport_available(TransportType::NCCL)) {
+        selected = TransportType::NCCL;
+        label = "nccl (default; build has no rdma)";
+      } else if (transport_available(TransportType::CXI)) {
+        selected = TransportType::CXI;
+        label = "cxi (default; build has no rdma)";
+      }
     }
     if (!transport_available(selected))
-      throw std::invalid_argument(std::string("Transport ") + env +
+      throw std::invalid_argument(std::string("Transport ") + label +
                                   " is not enabled in this P2P build");
     return selected;
   }();

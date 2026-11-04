@@ -41,10 +41,8 @@ struct MrCacheEntry {
   uint64_t refs = 0;
 };
 
-struct MrCacheHandleRef {
-  std::shared_ptr<RdmaContext> context;
-  MrCacheEntry* entry = nullptr;
-};
+// MrCacheHandleRef is defined in common.h: it is part of the shared
+// P2PMhandle layout and must exist even in RDMA-less builds.
 
 class RdmaContext {
  public:

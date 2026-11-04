@@ -10,12 +10,12 @@
 #include <mutex>
 #include <vector>
 
-// When set on a thread, RDMADataChannel::submit_request() accumulates send
-// requests in a per-channel batch instead of immediately posting them. The
-// thread must subsequently call flush_batch() (typically via
+// g_uccl_batch_post (declared in common.h): when set on a thread,
+// RDMADataChannel::submit_request() accumulates send requests in a
+// per-channel batch instead of immediately posting them. The thread must
+// subsequently call flush_batch() (typically via
 // RDMAEndpoint::flush_all_sends()) to flush all pending work requests in a
 // single doorbell per channel.
-inline thread_local bool g_uccl_batch_post = false;
 
 class RDMADataChannel {
  public:

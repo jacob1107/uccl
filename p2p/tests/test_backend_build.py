@@ -67,7 +67,9 @@ class BackendBuildTests(unittest.TestCase):
                     )
 
     def test_disabling_optional_transports_removes_their_sources(self):
-        output = self.make(ROOT / "p2p", "-n", "ENABLE_NCCL=0", "ENABLE_CXI=0", "all")
+        output = self.make(
+            ROOT / "p2p", "-n", "ENABLE_RDMA=1", "ENABLE_NCCL=0", "ENABLE_CXI=0", "all"
+        )
         for forbidden in (
             "nccl_endpoint.cc",
             "cxi_endpoint.cc",
@@ -75,6 +77,88 @@ class BackendBuildTests(unittest.TestCase):
             "nccl_dl.cc",
         ):
             self.assertNotIn(forbidden, output)
+
+    def test_default_build_omits_the_verbs_data_plane(self):
+        output = self.make(ROOT / "p2p", "-n", "all")
+        for forbidden in (
+            "rdma_endpoint.cc",
+            "rdma_data_channel.cc",
+            "rdma_connection.cc",
+            "rdma_context.cc",
+            "rdma_ctrl_channel.cc",
+            "rdma_device.cc",
+            "ib_data_channel_impl.cc",
+            "efa_data_channel_impl.cc",
+            "ibverbs_dl.cc",
+            "efadv_dl.cc",
+            "--wrap=ibv_",
+        ):
+            self.assertNotIn(forbidden, output)
+        self.assertIn("-DUCCL_P2P_ENABLE_RDMA=0", output)
+        # The compression-context factory is transport-agnostic (used by
+        # Endpoint::reg()) and must stay in every build.
+        self.assertIn("compression.cc", output)
+        # EFA rides on the RDMA provider stack and is disabled alongside it.
+        self.assertNotIn("-DUCCL_P2P_ENABLE_EFA=1", output)
+
+    def test_enabling_rdma_restores_the_verbs_data_plane(self):
+        output = self.make(ROOT / "p2p", "-n", "ENABLE_RDMA=1", "all")
+        for required in (
+            "rdma_endpoint.cc",
+            "rdma/providers/ib_data_channel_impl.cc",
+            "ibverbs_dl.cc",
+            "--wrap=ibv_get_device_list",
+            "-DUCCL_P2P_ENABLE_RDMA=1",
+        ):
+            self.assertIn(required, output)
+
+    def test_rdma_only_profile_forces_and_protects_rdma(self):
+        # MUSA is RDMA/IPC-only: its profile re-enables the verbs data plane
+        # and rejects an explicit opt-out.
+        output = self.make(ROOT / "p2p", "-n", "-f", "Makefile.musa", "all")
+        self.assertIn("rdma/ibverbs_dl.cc", output)
+        self.assertIn("-DUCCL_P2P_ENABLE_RDMA=1", output)
+        result = subprocess.run(
+            [
+                "make",
+                "PYTHON=true",
+                "PYTHON_CONFIG=true",
+                "NB_DIR=/test/nanobind",
+                "NB_OBJECTS=",
+                "-n",
+                "-f",
+                "Makefile.musa",
+                "ENABLE_RDMA=0",
+                "all",
+            ],
+            cwd=ROOT / "p2p",
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("PROFILE=musa requires ENABLE_RDMA=1", result.stderr)
+
+    def test_enabling_efa_without_rdma_fails_loudly(self):
+        result = subprocess.run(
+            [
+                "make",
+                "PYTHON=true",
+                "PYTHON_CONFIG=true",
+                "NB_DIR=/test/nanobind",
+                "NB_OBJECTS=",
+                "-n",
+                "ENABLE_RDMA=0",
+                "ENABLE_EFA=1",
+                "all",
+            ],
+            cwd=ROOT / "p2p",
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ENABLE_EFA=1 requires ENABLE_RDMA=1", result.stderr)
 
     def test_native_link_does_not_require_python_embedding_libraries(self):
         with tempfile.TemporaryDirectory() as directory:

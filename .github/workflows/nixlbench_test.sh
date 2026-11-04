@@ -52,10 +52,12 @@ source "${MINICONDA_DIR}/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV}"
 
 # ── Build UCCL p2p and install ────────────────────────
+# These tests exercise UCCL_P2P_TRANSPORT=rdma, so opt back into the verbs
+# data plane (ENABLE_RDMA defaults to 0).
 echo "=== Building UCCL p2p ==="
 cd "${UCCL_ROOT}/p2p"
-make -j"$(nproc)" PYTHON=python3
-make install PYTHON=python3 LIBDIR="${NIXL_INSTALL_DIR}/lib" PREFIX="${NIXL_INSTALL_DIR}"
+make -j"$(nproc)" PYTHON=python3 ENABLE_RDMA=1
+make install PYTHON=python3 ENABLE_RDMA=1 LIBDIR="${NIXL_INSTALL_DIR}/lib" PREFIX="${NIXL_INSTALL_DIR}"
 
 export LIBRARY_PATH="${NIXL_INSTALL_DIR}/lib:${LIBRARY_PATH:-}"
 

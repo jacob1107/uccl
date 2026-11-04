@@ -1,8 +1,9 @@
 #pragma once
 
 #include "common.h"
-#include "rdma_context.h"
 #include "util/gpu_rt.h"
+
+class RdmaContext;
 
 class MemoryAllocator {
  public:

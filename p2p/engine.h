@@ -3,6 +3,7 @@
 #include "adaptive_sleeper.h"
 #include "common.h"
 #include "device/staging.h"
+#include "rdma_connection.h"  // SendConnection (real when RDMA enabled, stub otherwise)
 #include "transport/endpoint.h"
 #include "transport_type.h"
 #include "util/debug.h"
@@ -11,7 +12,12 @@
 #include "util/net.h"
 #include "util/shared_pool.h"
 #include "util/util.h"
+#if UCCL_P2P_ENABLE_RDMA
 #include <infiniband/verbs.h>
+#else
+// Mhandle holds a pointer only; common.h forward-declares ibv_mr for
+// RDMA-less builds.
+#endif
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -26,6 +32,10 @@
 #include <vector>
 
 extern thread_local bool inside_python;
+
+// OOB metadata-exchange client (util/epoll_client.h). Declared here so this
+// header does not depend on any transport header providing it.
+class EpollClient;
 
 // Use the RDMA-native request types as the common currency.
 // The transport adapters convert native request layouts as needed.

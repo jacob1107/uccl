@@ -80,6 +80,7 @@ size_t ChunkSplitStrategy::get_regular_chunk_size(size_t message_size,
   return (message_size + chunk_count - 1) / chunk_count;
 }
 
+#if UCCL_P2P_ENABLE_RDMA
 void copy_rkey_array_from_mr_array(MRArray const& mr_array,
                                    RKeyArray& rkey_array) {
   for (uint32_t ctx = 0; ctx < kNICContextNumber; ++ctx) {
@@ -114,6 +115,7 @@ std::ostream& operator<<(std::ostream& os, ChannelMetaData const& meta) {
   os << "}";
   return os;
 }
+#endif
 
 OOBMetaData::OOBMetaData() : server_ip(""), server_port(0), gpu_id(0) {}
 
@@ -127,6 +129,7 @@ std::ostream& operator<<(std::ostream& os, OOBMetaData const& meta) {
   return os;
 }
 
+#if UCCL_P2P_ENABLE_RDMA
 bool CQMeta::has_imm() const { return op_code == IBV_WC_RECV_RDMA_WITH_IMM; }
 
 std::ostream& operator<<(std::ostream& os, CQMeta const& meta) {
@@ -135,6 +138,7 @@ std::ostream& operator<<(std::ostream& os, CQMeta const& meta) {
      << ", has_imm: " << (meta.op_code == IBV_WC_RECV_RDMA_WITH_IMM) << "}";
   return os;
 }
+#endif
 
 RegMemBlock::RegMemBlock() : addr(nullptr), size(0), type(MemoryType::HOST) {}
 
@@ -167,6 +171,7 @@ struct ibv_mr* RegMemBlock::get_mr_by_context_id(uint32_t context_id) const {
   return mr_array.get_key_by_context_id(context_id);
 }
 
+#if UCCL_P2P_ENABLE_RDMA
 uint32_t RegMemBlock::get_rkey_by_channel_id(uint32_t channel_id) const {
   struct ibv_mr* mr = get_mr_by_channel_id(channel_id);
   return mr ? mr->rkey : 0;
@@ -186,6 +191,7 @@ uint32_t RegMemBlock::get_lkey_by_context_id(uint32_t context_id) const {
   struct ibv_mr* mr = get_mr_by_context_id(context_id);
   return mr ? mr->lkey : 0;
 }
+#endif
 
 std::ostream& operator<<(std::ostream& os, RegMemBlock const& block) {
   os << "RegMemBlock{addr: " << block.addr << ", size: " << block.size
@@ -204,6 +210,7 @@ RemoteMemInfo::RemoteMemInfo(uint64_t a, size_t len, RKeyArray const& rkey,
   rkey_array.copy_from(rkey);
 }
 
+#if UCCL_P2P_ENABLE_RDMA
 RemoteMemInfo::RemoteMemInfo(uint64_t a, size_t len, MRArray const& mrs,
                              MemoryType t)
     : addr(a), length(len), type(t) {
@@ -223,6 +230,7 @@ RemoteMemInfo::RemoteMemInfo(std::shared_ptr<RegMemBlock> const block)
       type(block->type) {
   copy_rkey_array_from_mr_array(block->mr_array, rkey_array);
 }
+#endif
 
 uint32_t RemoteMemInfo::get_rkey_by_channel_id(uint32_t channel_id) const {
   return rkey_array.get_key_by_channel_id(channel_id);
@@ -264,6 +272,7 @@ RDMASendRequest::RDMASendRequest(RDMASendRequest const& other,
       imm_data(imm),
       need_signaled(signaled) {}
 
+#if UCCL_P2P_ENABLE_RDMA
 uint32_t RDMASendRequest::get_local_key() const {
   return local_mem->get_lkey_by_channel_id(channel_id);
 }
@@ -271,6 +280,7 @@ uint32_t RDMASendRequest::get_local_key() const {
 uint32_t RDMASendRequest::get_remote_key() const {
   return remote_mem->get_rkey_by_channel_id(channel_id);
 }
+#endif
 
 uint64_t RDMASendRequest::get_local_address() const {
   return reinterpret_cast<uint64_t>(local_mem->addr);
@@ -304,6 +314,7 @@ std::ostream& operator<<(std::ostream& os, RDMASendRequest const& req) {
   return os;
 }
 
+#if UCCL_P2P_ENABLE_RDMA
 MetaInfoToExchange::MetaInfoToExchange()
     : peer_id(0),
       channel_id(0),
@@ -358,6 +369,7 @@ std::ostream& operator<<(std::ostream& os, MetaInfoToExchange const& meta) {
 
   return os;
 }
+#endif
 
 int make_socket_non_blocking(int fd) {
   int flags = fcntl(fd, F_GETFL, 0);
@@ -375,6 +387,7 @@ ssize_t try_send(int fd, char const* buf, size_t len) {
   return n;
 }
 
+#if UCCL_P2P_ENABLE_RDMA
 bool is_nic_usable(std::string const& nic_name, NicMode mode) {
   if (mode == NicMode::EFA && strncmp(nic_name.c_str(), "rdmap", 5) != 0) {
     return false;
@@ -418,6 +431,7 @@ bool is_nic_usable(std::string const& nic_name, NicMode mode) {
   ibv_free_device_list(dev_list);
   return usable;
 }
+#endif
 
 namespace std {
 size_t hash<RegMemBlock>::operator()(RegMemBlock const& block) const {

@@ -1,5 +1,8 @@
 #include "memory_allocator.h"
 #include "util/gpu_rt.h"
+#if UCCL_P2P_ENABLE_RDMA
+#include "rdma_context.h"
+#endif
 
 MemoryAllocator::MemoryAllocator() : page_size_(sysconf(_SC_PAGESIZE)) {
   if (page_size_ <= 0) {
@@ -33,6 +36,7 @@ std::shared_ptr<RegMemBlock> MemoryAllocator::allocate(
   };
 
   auto block = new RegMemBlock(addr, size, type);
+#if UCCL_P2P_ENABLE_RDMA
   if (ctx) {
     mr = ctx->reg_mem(addr, size);
 
@@ -42,6 +46,10 @@ std::shared_ptr<RegMemBlock> MemoryAllocator::allocate(
     }
     block->set_mr_by_context_id(ctx->get_context_id(), mr);
   }
+#else
+  (void)mr;
+  (void)ctx;
+#endif
 
   return std::shared_ptr<RegMemBlock>(block, deleter);
 }

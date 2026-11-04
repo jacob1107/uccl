@@ -157,7 +157,7 @@ NB_MODULE(p2p, m) {
         info["dmabuf_export_compiled"] = bool(UCCL_DEVICE_HAS_DMABUF);
         info["staged_network"] = Backend::staged_network;
         nb::list transports;
-        transports.append("rdma");
+        if (transport_available(TransportType::RDMA)) transports.append("rdma");
         if (transport_available(TransportType::NCCL)) transports.append("nccl");
         if (transport_available(TransportType::EFA)) transports.append("efa");
         if (transport_available(TransportType::CXI)) transports.append("cxi");
