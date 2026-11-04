@@ -2,21 +2,16 @@
 #define COMMON_H
 
 // Keep this header installable: it must stay self-contained without
-// project-relative includes. transport/config.h owns the canonical macro;
-// the build always passes -DUCCL_P2P_ENABLE_RDMA explicitly, so the
+// project-relative includes. transport/config.h owns the canonical macro
+// (pinned to 0: the ibverbs data plane was removed from this tree); the
 // fallback here only covers stale external consumers of the installed copy.
 #ifndef UCCL_P2P_ENABLE_RDMA
-#define UCCL_P2P_ENABLE_RDMA 1
+#define UCCL_P2P_ENABLE_RDMA 0
 #endif
 
-#if UCCL_P2P_ENABLE_RDMA
-#include <infiniband/efadv.h>
-#include <infiniband/verbs.h>
-#else
 // Shared engine types (MRArray, Mhandle) only hold pointers to MRs; a forward
 // declaration keeps them compiling without libibverbs headers.
 struct ibv_mr;
-#endif
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <algorithm>

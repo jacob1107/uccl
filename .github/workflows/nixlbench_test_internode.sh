@@ -2,7 +2,7 @@
 # Usage:
 #   nixlbench_test_internode.sh <NIXL_INSTALL_DIR> [--host-etcd]
 #
-# Runs inter-node nixlbench tests (RDMA + NCCL) across two nodes coordinating via etcd.
+# Runs inter-node nixlbench tests (NCCL) across two nodes coordinating via etcd.
 #
 #   --host-etcd: This node starts etcd on ETCD_HOST_IP:12379
 #   Without flag: This node connects to ETCD_HOST_IP
@@ -164,15 +164,6 @@ echo "NOTE: This script must run on BOTH nodes simultaneously!"
 echo ""
 
 OVERALL_STATUS=0
-
-run_test "rdma" || OVERALL_STATUS=1
-
-if [ $OVERALL_STATUS -ne 0 ]; then
-    echo "=== RDMA test FAILED ==="
-    exit 1
-fi
-
-sleep 2
 
 run_test "nccl" || OVERALL_STATUS=1
 

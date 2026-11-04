@@ -52,12 +52,10 @@ source "${MINICONDA_DIR}/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV}"
 
 # ── Build UCCL p2p and install ────────────────────────
-# These tests exercise UCCL_P2P_TRANSPORT=rdma, so opt back into the verbs
-# data plane (ENABLE_RDMA defaults to 0).
 echo "=== Building UCCL p2p ==="
 cd "${UCCL_ROOT}/p2p"
-make -j"$(nproc)" PYTHON=python3 ENABLE_RDMA=1
-make install PYTHON=python3 ENABLE_RDMA=1 LIBDIR="${NIXL_INSTALL_DIR}/lib" PREFIX="${NIXL_INSTALL_DIR}"
+make -j"$(nproc)" PYTHON=python3
+make install PYTHON=python3 LIBDIR="${NIXL_INSTALL_DIR}/lib" PREFIX="${NIXL_INSTALL_DIR}"
 
 export LIBRARY_PATH="${NIXL_INSTALL_DIR}/lib:${LIBRARY_PATH:-}"
 
@@ -212,8 +210,8 @@ ETCDCTL_API=3 etcdctl --endpoints="http://127.0.0.1:${ETCD_PORT}" endpoint healt
 # ── Run nixlbench across transport configurations ────────────────────────────
 #
 # Test matrix (single node, 2 processes each):
-#   1. RDMA + IPC        (default intra-node path)
-#   2. RDMA without IPC  (forced RDMA loopback)
+#   1. NCCL + IPC        (default intra-node path)
+#   2. NCCL without IPC
 
 NIXLBENCH_ARGS=(
     --etcd_endpoints "http://127.0.0.1:${ETCD_PORT}"
@@ -269,8 +267,8 @@ run_nixlbench_test() {
 
 OVERALL_RC=0
 
-run_nixlbench_test "RDMA + IPC"         rdma 0 || OVERALL_RC=1
-run_nixlbench_test "RDMA without IPC"   rdma 1 || OVERALL_RC=1
+run_nixlbench_test "NCCL + IPC"         nccl 0 || OVERALL_RC=1
+run_nixlbench_test "NCCL without IPC"   nccl 1 || OVERALL_RC=1
 
 echo ""
 echo "================================================================"

@@ -12,11 +12,6 @@ inline GenericEndpoint uccl_create_endpoint(int gpu_idx) {
     case TransportType::CXI:
       return std::make_shared<CxiEndpoint>(gpu_idx, 0);
 #endif
-#if UCCL_P2P_ENABLE_RDMA
-    case TransportType::RDMA:
-    case TransportType::EFA:
-      return std::make_shared<RDMAEndpoint>(gpu_idx, 0);
-#endif
     default:
       throw std::invalid_argument("Transport is not enabled in this P2P build");
   }

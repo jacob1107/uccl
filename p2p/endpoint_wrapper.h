@@ -1,9 +1,5 @@
 #pragma once
 #include "engine.h"
-#if UCCL_P2P_ENABLE_RDMA
-#include "transport/rdma_ops.h"
-#include "transport/rdma_request.h"
-#endif
 #if UCCL_P2P_ENABLE_NCCL
 #include "transport/nccl_ops.h"
 #endif
@@ -165,28 +161,8 @@ inline int uccl_write_async(GenericEndpoint const& ep, Conn* conn,
       ep);
 }
 
-// RDMA hot paths use a pre-resolved group and bypass variant dispatch.
-#if UCCL_P2P_ENABLE_RDMA
-inline int uccl_write_async_on_group(SendConnection* send_group, Conn* conn,
-                                     P2PMhandle* local_mh, void* src,
-                                     size_t size, FifoItem const& slot_item,
-                                     UcclRequest* ureq) {
-  ureq->type = ReqType::ReqWrite;
-  return set_request_on_group(send_group, conn, local_mh, src, size, slot_item,
-                              ureq);
-}
-
-inline int uccl_read_async_on_group(SendConnection* send_group, Conn* conn,
-                                    P2PMhandle* local_mh, void* dst,
-                                    size_t size, FifoItem const& slot_item,
-                                    UcclRequest* ureq) {
-  ureq->type = ReqType::ReqRead;
-  return set_request_on_group(send_group, conn, local_mh, dst, size, slot_item,
-                              ureq);
-}
-#else
-// Without the RDMA transport no send group can ever be resolved, so the
-// on-group fast paths are unreachable; fail closed if ever called.
+// The ibverbs data plane is gone, so no send group can ever be resolved and
+// the on-group fast paths are unreachable; fail closed if ever called.
 inline int uccl_write_async_on_group(SendConnection* send_group, Conn* conn,
                                      P2PMhandle* local_mh, void* src,
                                      size_t size, FifoItem const& slot_item,
@@ -214,7 +190,6 @@ inline int uccl_read_async_on_group(SendConnection* send_group, Conn* conn,
   ureq->type = ReqType::ReqRead;
   return SendConnection::kPostError;
 }
-#endif
 
 inline int prepare_fifo_metadata(GenericEndpoint const& ep, P2PMhandle* mhandle,
                                  void const* data, size_t size, char* out_buf) {

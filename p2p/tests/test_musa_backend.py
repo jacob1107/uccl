@@ -213,11 +213,12 @@ int main() {
                 if name is not None:
                     env["UCCL_P2P_TRANSPORT"] = name
                 result = self.compile(source, "-DUCCL_USE_MUSA", env=env)
+                self.assertEqual(result.returncode, 2)
                 if name is None or name in ("rdma", "ib"):
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(result.stdout, "0")
+                    # The verbs data plane is gone, so even the accepted
+                    # aliases have nothing to select.
+                    self.assertIn("is not enabled", result.stderr)
                 else:
-                    self.assertEqual(result.returncode, 2)
                     self.assertIn("musa", result.stderr)
 
     def test_existing_transport_selection_unchanged(self):
@@ -225,95 +226,49 @@ int main() {
             '#include <iostream>\n#include "util/transport_type.h"\n'
             "int main() { std::cout << static_cast<int>(get_transport_type()); }"
         )
-        for name, value in (("rdma", "0"), ("nccl", "1"), ("efa", "2"), ("cxi", "3")):
+        for name, value in (("nccl", "1"), ("cxi", "3"), ("tcp", "1"), ("tcpx", "1")):
             result = self.compile(
                 source, env={**os.environ, "UCCL_P2P_TRANSPORT": name}
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, value)
-
-    def test_musa_makefile_isolated_rdma_build(self):
-        makefile = ROOT / "p2p/Makefile.musa"
-        self.assertTrue(makefile.is_file(), "MUSA native Makefile is missing")
-        with tempfile.TemporaryDirectory() as directory:
-            build_dir = Path(directory) / "isolated-build"
-            result = subprocess.run(
-                [
-                    "make",
-                    "-n",
-                    "-f",
-                    str(makefile),
-                    "all",
-                    f"BUILD_DIR={build_dir}",
-                    "PYTHON=true",
-                    "PYTHON_CONFIG=true",
-                    "NB_DIR=/fake/nanobind",
-                    "MUSA_HOME=/fake/musa",
-                    "NB_OBJECTS=",
-                ],
-                cwd=ROOT / "p2p",
-                capture_output=True,
-                text=True,
-                timeout=10,
+        # The ibverbs data plane was removed: its aliases fail closed.
+        for name in ("rdma", "ib", "efa"):
+            result = self.compile(
+                source, env={**os.environ, "UCCL_P2P_TRANSPORT": name}
             )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("-DUCCL_USE_MUSA", result.stdout)
-        self.assertIn(f"{build_dir}/", result.stdout)
-        self.assertIn("-lmusart", result.stdout)
-        self.assertIn("-lmusa", result.stdout)
-        self.assertIn("rdma/ibverbs_dl.cc", result.stdout)
-        self.assertIn("libuccl_p2p.so", result.stdout)
-        for unwanted in (
-            "-lcuda",
-            "-lcudart",
-            "-lamdhip64",
-            "nccl_endpoint.cc",
-            "cxi_endpoint.cc",
-            "mlu_staging.cc",
-        ):
-            self.assertNotIn(unwanted, result.stdout)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("is not enabled", result.stderr)
 
-    def test_newer_foreign_backend_artifact_cannot_skip_musa_link(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            shutil.copyfile(ROOT / "p2p/Makefile.musa", root / "Makefile.musa")
-            shutil.copytree(ROOT / "p2p/make", root / "make")
-            for name in ("cached.o", ".build/musa/uccl_engine.o", "uccl_engine.cc"):
-                path = root / name
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.touch()
-                os.utime(path, (100, 100))
-            library = root / "libuccl_p2p.so"
-            library.write_text("previous CUDA backend")
-            os.utime(library, (200, 200))
-            result = subprocess.run(
-                [
-                    "make",
-                    "-n",
-                    "-f",
-                    "Makefile.musa",
-                    "libuccl_p2p.so",
-                    "CORE_OBJECTS=cached.o",
-                    "BUILD_DIR=.build/musa",
-                    "PYTHON=true",
-                    "PYTHON_CONFIG=true",
-                    "NB_DIR=/fake/nanobind",
-                ],
-                cwd=root,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("-lmusart", result.stdout)
+    def test_musa_makefile_fails_without_the_rdma_data_plane(self):
+        # MUSA is RDMA/IPC-only and the ibverbs data plane was removed, so the
+        # profile must fail loudly instead of building a transport-less engine.
+        result = subprocess.run(
+            [
+                "make",
+                "-n",
+                "-f",
+                str(ROOT / "p2p/Makefile.musa"),
+                "all",
+                "PYTHON=true",
+                "PYTHON_CONFIG=true",
+                "NB_DIR=/fake/nanobind",
+                "NB_OBJECTS=",
+            ],
+            cwd=ROOT / "p2p",
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("PROFILE=musa is unsupported", result.stderr)
+        self.assertIn("ibverbs RDMA data plane was removed", result.stderr)
 
     def test_install_removes_stale_python_extension_variants(self):
         result = subprocess.run(
             [
                 "make",
                 "-n",
-                "-f",
-                "Makefile.musa",
                 "install",
                 "PYTHON=true",
                 "PYTHON_CONFIG=true",

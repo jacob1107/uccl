@@ -165,19 +165,14 @@ build_p2p() {
   fi
 
   cd p2p
-  # ENABLE_RDMA defaults to 0 (no ibverbs data plane). EFA instances must keep
-  # it: the EFA transport rides on the RDMA provider stack.
-  local MAKE_RDMA_FLAG=""
-  if [[ -n "$IS_EFA" ]]; then
-    MAKE_RDMA_FLAG="ENABLE_RDMA=1"
-    echo "[container] EFA host detected: building P2P with ENABLE_RDMA=1"
-  fi
+  # The ibverbs data plane was removed; p2p builds NCCL/CXI + IPC everywhere
+  # (the collective EFA plugin below is unaffected).
   if [[ "$TARGET" == cu* ]]; then
-    make clean && make -j$(nproc) $MAKE_RDMA_FLAG
+    make clean && make -j$(nproc)
   elif [[ "$TARGET" == roc[67] ]]; then
-    make clean -f Makefile.rocm && make -j$(nproc) -f Makefile.rocm $MAKE_RDMA_FLAG
+    make clean -f Makefile.rocm && make -j$(nproc) -f Makefile.rocm
   elif [[ "$TARGET" == "therock" ]]; then
-    make clean -f Makefile.therock && make -j$(nproc) -f Makefile.therock HIP_HOME=$(rocm-sdk path --root) CONDA_LIB_HOME=$VIRTUAL_ENV/lib $MAKE_RDMA_FLAG
+    make clean -f Makefile.therock && make -j$(nproc) -f Makefile.therock HIP_HOME=$(rocm-sdk path --root) CONDA_LIB_HOME=$VIRTUAL_ENV/lib
   fi
   cd ..
 

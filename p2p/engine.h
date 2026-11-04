@@ -3,7 +3,7 @@
 #include "adaptive_sleeper.h"
 #include "common.h"
 #include "device/staging.h"
-#include "rdma_connection.h"  // SendConnection (real when RDMA enabled, stub otherwise)
+#include "send_connection.h"  // fail-closed SendConnection stub
 #include "transport/endpoint.h"
 #include "transport_type.h"
 #include "util/debug.h"
@@ -12,12 +12,7 @@
 #include "util/net.h"
 #include "util/shared_pool.h"
 #include "util/util.h"
-#if UCCL_P2P_ENABLE_RDMA
-#include <infiniband/verbs.h>
-#else
-// Mhandle holds a pointer only; common.h forward-declares ibv_mr for
-// RDMA-less builds.
-#endif
+// Mhandle holds a pointer only; common.h forward-declares ibv_mr.
 #include <atomic>
 #include <cstdlib>
 #include <cstring>

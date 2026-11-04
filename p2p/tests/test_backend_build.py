@@ -36,7 +36,6 @@ class BackendBuildTests(unittest.TestCase):
             "dtk": "-lamdhip64",
             "therock": "-lamdhip64",
             "cnrt": "-lcnrt",
-            "musa": "-lmusart",
         }
         for profile, library in runtimes.items():
             with self.subTest(profile=profile):
@@ -46,14 +45,6 @@ class BackendBuildTests(unittest.TestCase):
                 self.assertIn(f".build/{profile}/", output)
                 for other in set(runtimes.values()) - {library}:
                     self.assertNotIn(other, output)
-                if profile == "musa":
-                    for forbidden in (
-                        "cxi/cxi_endpoint.cc",
-                        "nccl/nccl_endpoint.cc",
-                        "-I./nccl",
-                        "-I/opt/libfabric/include",
-                    ):
-                        self.assertNotIn(forbidden, output)
                 if profile == "cnrt":
                     # Both Python and C entry points must link the staging TU.
                     links = [
@@ -68,7 +59,7 @@ class BackendBuildTests(unittest.TestCase):
 
     def test_disabling_optional_transports_removes_their_sources(self):
         output = self.make(
-            ROOT / "p2p", "-n", "ENABLE_RDMA=1", "ENABLE_NCCL=0", "ENABLE_CXI=0", "all"
+            ROOT / "p2p", "-n", "ENABLE_NCCL=0", "ENABLE_CXI=0", "all"
         )
         for forbidden in (
             "nccl_endpoint.cc",
@@ -78,7 +69,7 @@ class BackendBuildTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, output)
 
-    def test_default_build_omits_the_verbs_data_plane(self):
+    def test_verbs_data_plane_is_removed(self):
         output = self.make(ROOT / "p2p", "-n", "all")
         for forbidden in (
             "rdma_endpoint.cc",
@@ -92,32 +83,17 @@ class BackendBuildTests(unittest.TestCase):
             "ibverbs_dl.cc",
             "efadv_dl.cc",
             "--wrap=ibv_",
+            "-I./rdma",
+            "/opt/amazon/efa/include",
         ):
             self.assertNotIn(forbidden, output)
-        self.assertIn("-DUCCL_P2P_ENABLE_RDMA=0", output)
         # The compression-context factory is transport-agnostic (used by
-        # Endpoint::reg()) and must stay in every build.
-        self.assertIn("compression.cc", output)
-        # EFA rides on the RDMA provider stack and is disabled alongside it.
-        self.assertNotIn("-DUCCL_P2P_ENABLE_EFA=1", output)
+        # Endpoint::reg()) and moved to util/.
+        self.assertIn("util/compression.cc", output)
 
-    def test_enabling_rdma_restores_the_verbs_data_plane(self):
-        output = self.make(ROOT / "p2p", "-n", "ENABLE_RDMA=1", "all")
-        for required in (
-            "rdma_endpoint.cc",
-            "rdma/providers/ib_data_channel_impl.cc",
-            "ibverbs_dl.cc",
-            "--wrap=ibv_get_device_list",
-            "-DUCCL_P2P_ENABLE_RDMA=1",
-        ):
-            self.assertIn(required, output)
-
-    def test_rdma_only_profile_forces_and_protects_rdma(self):
-        # MUSA is RDMA/IPC-only: its profile re-enables the verbs data plane
-        # and rejects an explicit opt-out.
-        output = self.make(ROOT / "p2p", "-n", "-f", "Makefile.musa", "all")
-        self.assertIn("rdma/ibverbs_dl.cc", output)
-        self.assertIn("-DUCCL_P2P_ENABLE_RDMA=1", output)
+    def test_rdma_only_profile_fails_loudly(self):
+        # MUSA is RDMA/IPC-only and the verbs data plane is gone, so the
+        # profile must fail at parse time instead of building.
         result = subprocess.run(
             [
                 "make",
@@ -128,7 +104,6 @@ class BackendBuildTests(unittest.TestCase):
                 "-n",
                 "-f",
                 "Makefile.musa",
-                "ENABLE_RDMA=0",
                 "all",
             ],
             cwd=ROOT / "p2p",
@@ -137,28 +112,7 @@ class BackendBuildTests(unittest.TestCase):
             timeout=15,
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("PROFILE=musa requires ENABLE_RDMA=1", result.stderr)
-
-    def test_enabling_efa_without_rdma_fails_loudly(self):
-        result = subprocess.run(
-            [
-                "make",
-                "PYTHON=true",
-                "PYTHON_CONFIG=true",
-                "NB_DIR=/test/nanobind",
-                "NB_OBJECTS=",
-                "-n",
-                "ENABLE_RDMA=0",
-                "ENABLE_EFA=1",
-                "all",
-            ],
-            cwd=ROOT / "p2p",
-            text=True,
-            capture_output=True,
-            timeout=15,
-        )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("ENABLE_EFA=1 requires ENABLE_RDMA=1", result.stderr)
+        self.assertIn("PROFILE=musa is unsupported", result.stderr)
 
     def test_native_link_does_not_require_python_embedding_libraries(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -171,7 +125,7 @@ class BackendBuildTests(unittest.TestCase):
                 "print('-lpython-contract' if '--embed' in sys.argv else '')\n"
             )
             config.chmod(0o755)
-            for profile in ("cuda", "rocm", "dtk", "therock", "cnrt", "musa"):
+            for profile in ("cuda", "rocm", "dtk", "therock", "cnrt"):
                 with self.subTest(profile=profile):
                     output = self.make(
                         ROOT / "p2p",

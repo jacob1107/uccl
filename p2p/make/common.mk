@@ -4,32 +4,18 @@
 PROFILE ?= cuda
 include make/profiles/$(PROFILE).mk
 
-# The ibverbs (IB/RoCE + EFA) data plane is off by default; ENABLE_RDMA=1
-# restores it. The RDMA/IPC-only MUSA profile re-enables it unconditionally.
-ENABLE_RDMA ?= 0
+# The ibverbs (IB/RoCE + EFA) data plane was removed from this tree; NCCL and
+# CXI are the remaining network transports. ENABLE_NCCL/ENABLE_CXI keep working
+# as before.
 ENABLE_NCCL ?= 1
 ENABLE_CXI ?= 1
-ENABLE_EFA ?= 1
 USE_DIETGPU ?= 0
 PYTHON ?= python3
 PYTHON_CONFIG ?= $(PYTHON)-config
 PREFIX ?= /usr/local
 LIBDIR ?= $(PREFIX)/lib
 INCDIR ?= $(PREFIX)/include
-EFA_HOME ?= /opt/amazon/efa
 LIBFABRIC_HOME ?= /opt/libfabric
-
-# EFA rides on the RDMA (ibverbs) provider stack and cannot be built without
-# it. Disabling RDMA implicitly disables EFA; explicitly requesting both is an
-# error so silent capability loss cannot go unnoticed.
-ifeq ($(ENABLE_RDMA),0)
-ifneq ($(ENABLE_EFA),0)
-ifeq ($(origin ENABLE_EFA),command line)
-$(error ENABLE_EFA=1 requires ENABLE_RDMA=1 (EFA shares the ibverbs provider stack))
-endif
-ENABLE_EFA := 0
-endif
-endif
 
 NB_DIR ?= $(shell $(PYTHON) -c "import nanobind, os; print(os.path.dirname(nanobind.__file__))")
 NB_SRC_DIR := $(NB_DIR)/src
@@ -48,26 +34,14 @@ INSTALL_DIR ?= $(shell $(PYTHON) -c "import site; print(site.getsitepackages()[0
 
 # Isolate device, optional features and Python ABI. A config stamp below also
 # invalidates objects when compilers, SDK paths or user flags change in place.
-BUILD_DIR ?= .build/$(PROFILE)/rdma$(ENABLE_RDMA)-nccl$(ENABLE_NCCL)-cxi$(ENABLE_CXI)-efa$(ENABLE_EFA)-diet$(USE_DIETGPU)/$(PYEXT)
-RDMA_CPPFLAGS := -DUCCL_P2P_ENABLE_RDMA=$(ENABLE_RDMA)
-ifeq ($(ENABLE_RDMA),1)
-RDMA_CPPFLAGS += -I$(EFA_HOME)/include
-IBV_WRAP_FLAGS := -Wl,--wrap=ibv_get_device_list \
-  -Wl,--wrap=ibv_query_port -Wl,--wrap=ibv_reg_mr \
-  -Wl,--wrap=ibv_reg_dmabuf_mr -Wl,--wrap=ibv_create_cq \
-  -Wl,--wrap=ibv_create_qp -Wl,--wrap=ibv_qp_to_qp_ex
-else
-IBV_WRAP_FLAGS :=
-endif
-override CPPFLAGS += -I. -I./util -I./rdma -I./rdma/providers -I../include \
+BUILD_DIR ?= .build/$(PROFILE)/nccl$(ENABLE_NCCL)-cxi$(ENABLE_CXI)-diet$(USE_DIETGPU)/$(PYEXT)
+override CPPFLAGS += -I. -I./util -I../include \
   $(DEVICE_CPPFLAGS) -DUCCL_DEVICE_BACKEND_HEADER=\"util/device/$(DEVICE_BACKEND)/config.h\" \
-  $(RDMA_CPPFLAGS) \
-  -DUCCL_P2P_ENABLE_NCCL=$(ENABLE_NCCL) -DUCCL_P2P_ENABLE_CXI=$(ENABLE_CXI) \
-  -DUCCL_P2P_ENABLE_EFA=$(ENABLE_EFA)
+  -DUCCL_P2P_ENABLE_NCCL=$(ENABLE_NCCL) -DUCCL_P2P_ENABLE_CXI=$(ENABLE_CXI)
 override CXXFLAGS += -O3 -std=c++17 -fPIC -MMD -MP \
   -Wno-pointer-arith -Wno-sign-compare -Wno-unused-variable
 override LDLIBS += $(DEVICE_LDLIBS) -lz -lelf -lpthread -ldl
-override LDFLAGS += -shared -Wl,-Bsymbolic-functions $(IBV_WRAP_FLAGS)
+override LDFLAGS += -shared -Wl,-Bsymbolic-functions
 
 ifeq ($(USE_DIETGPU),1)
 ifneq ($(DIETGPU_SUPPORTED),1)
@@ -80,20 +54,12 @@ override LDLIBS += -L$(DIETGPU_FLOAT_DIR) -ldietgpu_float \
   -Wl,-rpath,$(abspath $(DIETGPU_FLOAT_DIR)) -Wl,-rpath,'$$ORIGIN/lib'
 endif
 
-# compression.cc provides the (transport-agnostic) compression-context
-# factory used by Endpoint::reg(); it stays in every build. The rest of rdma/
-# is the ibverbs data plane and is only built with ENABLE_RDMA=1.
+# util/compression.cc provides the (transport-agnostic) compression-context
+# factory used by Endpoint::reg().
 CORE_SOURCES := engine.cc \
-  util/adaptive_sleeper.cc util/common.cc util/epoll_client.cc \
-  util/epoll_server.cc util/memory_allocator.cc util/seq_num.cc \
-  rdma/compression.cc $(DEVICE_SOURCES)
-ifeq ($(ENABLE_RDMA),1)
-CORE_SOURCES += rdma/rdma_context.cc rdma/rdma_connection.cc \
-  rdma/rdma_ctrl_channel.cc rdma/rdma_data_channel.cc \
-  rdma/rdma_device.cc rdma/rdma_endpoint.cc \
-  rdma/providers/efa_data_channel_impl.cc rdma/providers/ib_data_channel_impl.cc \
-  rdma/ibverbs_dl.cc rdma/efadv_dl.cc
-endif
+  util/adaptive_sleeper.cc util/common.cc util/compression.cc \
+  util/epoll_client.cc util/epoll_server.cc util/memory_allocator.cc \
+  util/seq_num.cc $(DEVICE_SOURCES)
 ifeq ($(ENABLE_NCCL),1)
 override CPPFLAGS += -I./nccl
 CORE_SOURCES += nccl/nccl_endpoint.cc nccl/nccl_dl.cc
@@ -152,7 +118,7 @@ clean:
 	rm -f $(P2P_PYTHON_EXT) $(P2P_SHARED_LIB) test_notify_serde test_epoll_server notif_e2e
 
 test_notify_serde: tests/test_notify_serde.cc util/common.h
-	$(CXX) -std=c++17 -O2 -I. -I./util $(RDMA_CPPFLAGS) -o $@ tests/test_notify_serde.cc
+	$(CXX) -std=c++17 -O2 -I. -I./util -o $@ tests/test_notify_serde.cc
 
 test_epoll_server: tests/test_epoll_server.cc util/epoll_server.cc util/epoll_server.h
 	$(CXX) -std=c++17 -O2 -I. -I./util -I../include -o $@ tests/test_epoll_server.cc util/epoll_server.cc -lpthread
@@ -172,5 +138,5 @@ install-deps:
 help:
 	@echo 'Targets: all install clean test test_notify_serde test_epoll_server notif_e2e install-deps'
 	@echo 'Profiles: Makefile (CUDA), Makefile.rocm, Makefile.dtk, Makefile.therock, Makefile.cnrt, Makefile.musa'
-	@echo 'Options: ENABLE_RDMA=0|1 ENABLE_NCCL=0|1 ENABLE_CXI=0|1 ENABLE_EFA=0|1 USE_DIETGPU=0|1'
+	@echo 'Options: ENABLE_NCCL=0|1 ENABLE_CXI=0|1 USE_DIETGPU=0|1'
 .PHONY: test install-deps help

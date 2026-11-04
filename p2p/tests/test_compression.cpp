@@ -4,11 +4,11 @@
  *
  * Build (CUDA):
  *   g++ -O3 -g test_compression.cpp -o test_compression \
- *       -I../../include -I../../../include -I../../../../thirdparty/dietgpu \
+ *       -I.. -I../util -I../../include -I../../../thirdparty/dietgpu \
  *       -I/usr/local/cuda/include -L/usr/local/cuda/lib64 \
- *       -L../../../../thirdparty/dietgpu/dietgpu/float -ldietgpu_float \
- *       -Wl,-rpath,../../../../thirdparty/dietgpu/dietgpu/float \
- *       -lcudart -lcuda -libverbs -lgflags -lpthread -std=c++17
+ *       -L../../../thirdparty/dietgpu/dietgpu/float -ldietgpu_float \
+ *       -Wl,-rpath,../../../thirdparty/dietgpu/dietgpu/float \
+ *       -lcudart -lcuda -lgflags -lpthread -std=c++17
  *
  * Build (ROCm/HIP):
  *   g++ -O3 -g test_compression.cpp -o test_compression \
@@ -18,7 +18,7 @@
  *       -I/opt/rocm/include -L/opt/rocm/lib \
  *       -L/io/uccl/thirdparty/dietgpu/dietgpu/float -ldietgpu_float \
  *       -Wl,-rpath,/io/uccl/thirdparty/dietgpu/dietgpu/float \
- *       -lamdhip64 -libverbs -lgflags -lpthread -std=c++17
+ *       -lamdhip64 -lgflags -lpthread -std=c++17
  *
  * Run:
  *   ./test_compression [--gpu_index=0] [--buffer_size=1048576]
@@ -31,7 +31,7 @@
 //     -I/opt/rocm/include -L/opt/rocm/lib \
 //     -L/io/uccl/thirdparty/dietgpu/dietgpu/float -ldietgpu_float \
 //    -Wl,-rpath,/io/uccl/thirdparty/dietgpu/dietgpu/float \
-//     -lamdhip64 -libverbs -lgflags -lpthread -std=c++17
+//     -lamdhip64 -lgflags -lpthread -std=c++17
 #include "compression.h"
 #include "memory_allocator.h"
 #include "util/debug.h"

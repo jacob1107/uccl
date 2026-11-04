@@ -60,9 +60,9 @@ sudo apt install build-essential net-tools libelf-dev libibverbs-dev \
 
 </details>
 
-To enable AWS EFA support, build with `make ENABLE_RDMA=1` (EFA rides on the
-RDMA provider stack, which the default build omits) and specify
-`UCCL_P2P_TRANSPORT=efa` during runtime. 
+AWS EFA support was removed together with the ibverbs data plane (the EFA
+transport rode on the RDMA provider stack); `UCCL_P2P_TRANSPORT=efa` now
+fails closed. The collective-layer EFA plugin is unaffected.
 
 To enable GCP TCPX support, you can refer to [NIXL_plugin_readme.md](./NIXL_plugin_readme.md).
 
@@ -97,23 +97,20 @@ at runtime with `UCCL_P2P_TRANSPORT`. The Makefile entry points share
 | `Makefile.dtk` | HIP | DTK, without DMA-BUF export |
 | `Makefile.therock` | HIP | TheRock |
 | `Makefile.cnrt` | CNRT | Neuware, with network staging |
-| `Makefile.musa` | MUSA | MUSA, RDMA/IPC only, without DMA-BUF export |
+| `Makefile.musa` | MUSA | unsupported: RDMA data plane removed |
 
-The ibverbs data plane is **off by default** (`ENABLE_RDMA=0`): builds
-contain no RC/SRD QPs, device discovery, OOB QP handshake, `libibverbs`
-headers, or linker wrappers, and network transfers use NCCL and/or CXI plus
-the unchanged intra-node IPC path. `make ENABLE_RDMA=1` opts back in. With
-RDMA absent, EFA is disabled implicitly (it rides on the RDMA provider
-stack), one-sided RDMA write/read, `advertise`-style rkey metadata, and the
-DietGPU-compressed write path are unavailable, and without
-`UCCL_P2P_TRANSPORT` set the first compiled-in transport (NCCL, then CXI)
-is selected instead of RDMA. EFA instance builds keep the verbs stack via
-`ENABLE_RDMA=1` (see `build_inner.sh`). NCCL/CXI can be excluded with
+The ibverbs (IB/RoCE + EFA) data plane was **removed from this tree**:
+there are no RC/SRD QPs, device discovery, OOB QP handshake, `libibverbs`
+headers or linker wrappers left. Network transfers use NCCL and/or CXI plus
+the unchanged intra-node IPC path. `UCCL_P2P_TRANSPORT=ib|rdma|efa` fails
+closed with a clear error; without `UCCL_P2P_TRANSPORT` set, the first
+compiled-in transport (`nccl`, then `cxi`) is selected. One-sided RDMA
+write/read, `advertise`-style rkey metadata, and the DietGPU-compressed
+write path are gone with it. NCCL/CXI can be excluded with
 `ENABLE_NCCL=0`/`ENABLE_CXI=0`, which also removes their sources and SDK
-header requirements; `ENABLE_EFA=1` together with `ENABLE_RDMA=0` fails the
-build. RDMA-only device backends (MUSA) force `ENABLE_RDMA=1` in their
-profile and reject disabling it. Unsupported selections fail before device
-initialization.
+header requirements. The RDMA-only MUSA profile can no longer build and
+fails at parse time with an explicit error. Unsupported selections fail
+before device initialization.
 Keep `PYTHON_CONFIG` consistent with `PYTHON` for non-default Python installs.
 Native callers use `in_python=false`; `libuccl_p2p.so` requires no `libpython`.
 
@@ -159,8 +156,7 @@ torchrun --nnodes=2 --nproc_per_node=1 --node-rank=1 --master_addr=<IP addr> ben
 
 Notes: 
 * You may consider exporting `GLOO_SOCKET_IFNAME=xxx NCCL_SOCKET_IFNAME=xxx` if triggering Gloo connectFullMesh failure.
-* You may consider exporting `UCCL_P2P_RDMA_GID_INDEX` if your cluster requires it for NCCL to run (usually 1, or 3 in some testbed).
-* You can specify `UCCL_P2P_TRANSPORT=ib|efa|nccl|tcp|tcpx|cxi` at runtime to choose different network backends. The default is `ib` (NVIDIA, Broadcom, AMD, and Intel RDMA NICs) in `ENABLE_RDMA=1` builds; in the default RDMA-less build it falls back to the first compiled-in transport (`nccl`, then `cxi`).
+* You can specify `UCCL_P2P_TRANSPORT=nccl|tcp|tcpx|cxi` at runtime to choose different network backends (`ib`/`rdma`/`efa` fail closed; the ibverbs data plane was removed). Without the variable set, the first compiled-in transport (`nccl`, then `cxi`) is selected.
 * **You must first import `torch` before importing `uccl.p2p` for AMD GPUs**, otherwise, `RuntimeError: No HIP GPUs are available` will occur. We guess this is because torch does some extra init for AMD GPUs, in order for Pybind-C++ code to work. 
 * One-sided network write is the default in `benchmark_uccl.py`; use `--mode read` for RDMA read.
 * To benchmark one-sided IPC write (GPU-to-GPU or CPU-to-GPU), `torchrun --nproc_per_node=2 benchmarks/benchmark_uccl.py --write-ipc`. Use `--device cpu --pinned` for CPU source buffers.
@@ -169,24 +165,17 @@ Notes:
 | Environment Variable | Description | Default Value |
 |---------------------|-------------|---------------|
 | UCCL_P2P_LOG_LEVEL | Logging level | WARNING (others: INFO, ERROR, FATAL) |
-| UCCL_P2P_RDMA_GID_INDEX | GID index in RDMA network | 0/3 (EFA/IB) |
-| UCCL_P2P_RDMA_MAX_RD_ATOMIC | Maximum outstanding RDMA READ requests initiated per QP | 16 |
-| UCCL_P2P_RDMA_MAX_DEST_RD_ATOMIC | Maximum outstanding RDMA READ requests accepted per QP from the peer | 16 |
-| UCCL_P2P_RDMA_SL | Service level in RDMA network | 8/3 (EFA/IB) |
-| UCCL_P2P_RDMA_TC | Traffic class in RDMA network | 104 (IB) |
-| UCCL_P2P_RDMA_DEV | RDMA devices forced to use (instead of auto-selecting based on PCIe affinity) | none (eg, `irdma-mkp0,irdma-mkp1`) |
-| UCCL_P2P_RDMA_RELAXED_ORDERING | PCIe relaxed ordering on RDMA memory registrations (`IBV_ACCESS_RELAXED_ORDERING`); set `0` to disable. Without it GPUDirect RDMA on IOMMU-remapped VMs can cap well below line rate | 1 (enabled) |
-| UCCL_P2P_TRANSPORT | Network backend to use at runtime | ib when compiled in (`ENABLE_RDMA=1`), else first compiled-in transport (nccl, then cxi) |
+| UCCL_P2P_TRANSPORT | Network backend to use at runtime | first compiled-in transport (nccl, then cxi); others: cxi/tcp/tcpx |
 | UCCL_CXI_DOMAIN | CXI/libfabric domain to use when `UCCL_P2P_TRANSPORT=cxi` | auto from GPU index, eg `cxi0` |
 | UCCL_CXI_DEVICE_INDEX | CXI device index used for automatic domain selection | GPU index modulo 4 |
 | UCCL_CXI_THREADING | libfabric threading hint for the CXI domain (`endpoint` is rejected by libfabric >= 2.x CXI) | safe |
 | UCCL_CXI_TX_QUEUE_SIZE | CXI transmit queue size | 4096 |
 | UCCL_CXI_RX_QUEUE_SIZE | CXI receive queue size | 4096 |
 | UCCL_CXI_CQ_SIZE | CXI completion queue size | 8192 |
-| UCCL_P2P_MAX_INFLIGHT_OPS | Maximum one-sided in-flight operations; CXI defaults lower than RDMA | 32 for CXI, otherwise internal maximum |
+| UCCL_P2P_MAX_INFLIGHT_OPS | Maximum one-sided in-flight operations; CXI defaults lower | 32 for CXI, otherwise internal maximum |
 | UCCL_LIBFABRIC_SO | Override libfabric shared-library path for the CXI dlsym wrapper | auto-detect `libfabric.so` / `libfabric.so.1` |
 | UCCL_P2P_COMPRESS_STRATEGY | DietGPU compression strategy (requires `USE_DIETGPU=1` build) | none |
-| UCCL_RDMA_ADAPTIVE_SLEEP | Enable adaptive sleeping on proxy threads, by putting the proxy threads into a sleeping state if there have been no new work requests / RDMA completion events after 120s. | null |
+| UCCL_RDMA_ADAPTIVE_SLEEP | Enable adaptive sleeping on proxy threads after 120s without new work requests or completion events | null |
 
 `UCCL_P2P_COMPRESS_STRATEGY` accepted values:
 * `none` / `off` / `0` — no compression
