@@ -2,6 +2,7 @@
 #include "common.h"
 #include "util/gpu_rt.h"
 #include "util/net.h"
+#include "util/util.h"
 #include <arpa/inet.h>
 #include <linux/tcp.h>
 #include <netinet/in.h>
@@ -75,22 +76,24 @@ int get_env_int(char const* key, int def) {
   return static_cast<int>(parsed);
 }
 
-// Size of the per-connection device staging buffer used for host-memory
-// transfers. Larger transfers are chunked through it.
-constexpr size_t kNcclStagingBytes = size_t(2) << 20;  // 2 MiB
+// Chunk size for large transfers and capacity of the per-connection device
+// staging buffer. This is a peer-visible constant: NCCL pairs ncclSend and
+// ncclRecv one-to-one, so both endpoints must split a transfer into exactly
+// the same chunk sequence regardless of where their local buffer lives (the
+// peer's buffer type is unknown to the other side). Any build change here
+// must stay in sync with the peer's build. Must match kStageChunk (4 MiB) in
+// the reference implementation on fork/jacob (ffcc9308).
+constexpr size_t kNcclStagingBytes = size_t(4) << 20;  // 4 MiB
 
 // NCCL p2p ops (ncclSend/ncclRecv) hand the user buffer straight to the
-// device kernel, which can only dereference GPU-visible memory (device or
-// managed allocations). Host buffers -- pinned or, worse, pageable (plain
-// torch CPU tensors) -- are not mapped in the GPU address space, so the
-// kernel faults and the matched op on the peer never completes, wedging both
-// the peer's control thread and the local polling loop. Any pointer that is
-// not device/managed memory must therefore be staged through a device buffer.
+// device kernel, which can only dereference GPU-visible memory. Host buffers
+// -- pinned or, worse, pageable (plain torch CPU tensors) -- are not mapped
+// in the GPU address space, so the kernel faults and the matched op on the
+// peer never completes, wedging both the peer's control thread and the local
+// polling loop. Any pointer that is not device memory must therefore be
+// staged through a device buffer.
 bool ptr_needs_staging(void const* p) {
-  gpuPointerAttribute_t attr{};
-  if (gpuPointerGetAttributes(&attr, p) != gpuSuccess) return true;
-  auto const kind = gpuMemTypeOf(attr);
-  return kind != gpuMemoryTypeDevice && kind != gpuMemoryTypeManaged;
+  return uccl::get_dev_idx(const_cast<void*>(p)) == -1;
 }
 
 // Record an event on record_stream and make wait_stream wait on it.
@@ -461,21 +464,25 @@ bool NCCLEndpoint::send_internal_(Conn& conn, void const* data, size_t size,
     return false;
   }
 
+  // Every transfer (host or device backed) is split into kNcclStagingBytes
+  // pieces so the ncclSend sequence pairs one-to-one with the peer's recv
+  // sequence; the peer mirrors this exact split regardless of its buffer
+  // type. Host chunks are copied through the staging buffer first.
   char const* cursor = static_cast<char const*>(data);
   size_t left = size;
   while (left > 0) {
-    size_t n = left;
+    size_t n = kNcclStagingBytes < left ? kNcclStagingBytes : left;
     void const* src = cursor;
     if (stage) {
-      n = kNcclStagingBytes < left ? kNcclStagingBytes : left;
       if (gpuMemcpyAsync(conn.staging, cursor, n, gpuMemcpyHostToDevice,
                          stream) != gpuSuccess) {
+        std::cerr << "[nccl] staging H2D copy failed" << std::endl;
         return false;
       }
       src = conn.staging;
     }
-    // Enqueue NCCL send on the selected communicator/stream. All chunks (and
-    // their staging copies) execute in stream order on a single stream.
+    // All chunks (and their staging copies) execute in stream order on a
+    // single stream.
     ncclResult_t rc = ncclSend(src, n, ncclChar, conn.remote_peer,
                                conn.comm[comm_index], stream);
     if (rc != ncclSuccess) {
@@ -530,18 +537,16 @@ bool NCCLEndpoint::recv_internal_(Conn& conn, void* data, size_t size,
     return false;
   }
 
+  // Mirrors the sender's kNcclStagingBytes split (NCCL pairs sends/recvs
+  // one-to-one); host destinations are filled through the staging buffer.
   char* cursor = static_cast<char*>(data);
   size_t left = size;
   while (left > 0) {
-    size_t n = left;
+    size_t n = kNcclStagingBytes < left ? kNcclStagingBytes : left;
     void* dst = cursor;
-    if (stage) {
-      n = kNcclStagingBytes < left ? kNcclStagingBytes : left;
-      dst = conn.staging;
-    }
-    // Enqueue NCCL recv on the selected communicator/stream. Each chunk's
-    // device-to-host copy is stream-ordered behind the recv that filled the
-    // staging buffer, so reuse of the buffer is safe.
+    if (stage) dst = conn.staging;
+    // Each chunk's device-to-host copy is stream-ordered behind the recv
+    // that filled the staging buffer, so reuse of the buffer is safe.
     ncclResult_t rc = ncclRecv(dst, n, ncclChar, conn.remote_peer,
                                conn.comm[comm_index], stream);
     if (rc != ncclSuccess) {
@@ -552,6 +557,7 @@ bool NCCLEndpoint::recv_internal_(Conn& conn, void* data, size_t size,
     if (stage) {
       if (gpuMemcpyAsync(cursor, conn.staging, n, gpuMemcpyDeviceToHost,
                          stream) != gpuSuccess) {
+        std::cerr << "[nccl] staging D2H copy failed" << std::endl;
         return false;
       }
     }

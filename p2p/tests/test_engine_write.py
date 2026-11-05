@@ -25,7 +25,7 @@ except ImportError as e:
 
 
 WRITE_VALUE = 7.0
-# Larger than one 2 MiB staging chunk so host-buffer transfers exercise the
+# Larger than one 4 MiB staging chunk so host-buffer transfers exercise the
 # chunked staging loop, not just the single-chunk fast path.
 BIG_NBYTES = 5 * 1024 * 1024
 SMALL_NBYTES = 4 * 1024
