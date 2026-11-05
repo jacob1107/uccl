@@ -153,6 +153,9 @@ class NCCLEndpoint {
                       NcclRequest* ureq);
   bool recv_internal_(Conn& conn, void* data, size_t size, int comm_index,
                       NcclRequest* ureq);
+  // Lazily allocate the per-connection device buffer used to stage
+  // host-memory transfers (NCCL kernels cannot dereference host pointers).
+  bool ensure_staging_(Conn& conn);
   void cleanup_conn_(Conn& conn);
 
   // GPU index the endpoint binds to by default.

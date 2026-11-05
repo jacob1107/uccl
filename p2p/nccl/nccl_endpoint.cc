@@ -75,6 +75,24 @@ int get_env_int(char const* key, int def) {
   return static_cast<int>(parsed);
 }
 
+// Size of the per-connection device staging buffer used for host-memory
+// transfers. Larger transfers are chunked through it.
+constexpr size_t kNcclStagingBytes = size_t(2) << 20;  // 2 MiB
+
+// NCCL p2p ops (ncclSend/ncclRecv) hand the user buffer straight to the
+// device kernel, which can only dereference GPU-visible memory (device or
+// managed allocations). Host buffers -- pinned or, worse, pageable (plain
+// torch CPU tensors) -- are not mapped in the GPU address space, so the
+// kernel faults and the matched op on the peer never completes, wedging both
+// the peer's control thread and the local polling loop. Any pointer that is
+// not device/managed memory must therefore be staged through a device buffer.
+bool ptr_needs_staging(void const* p) {
+  gpuPointerAttribute_t attr{};
+  if (gpuPointerGetAttributes(&attr, p) != gpuSuccess) return true;
+  auto const kind = gpuMemTypeOf(attr);
+  return kind != gpuMemoryTypeDevice && kind != gpuMemoryTypeManaged;
+}
+
 // Record an event on record_stream and make wait_stream wait on it.
 bool record_and_wait(gpuStream_t record_stream, gpuStream_t wait_stream) {
   gpuEvent_t evt = nullptr;
@@ -156,6 +174,15 @@ struct NCCLEndpoint::Conn {
   std::atomic<uint64_t> writes_completed{0};
   // Dedicated control-plane thread for this connection.
   std::thread ctrl_thread;
+  // Lazily allocated device buffer used to stage host-memory transfers
+  // (NCCL kernels can only touch GPU-visible memory). Guarded by staging_mu
+  // for allocation; reuse on the NCCL stream is stream-ordered.
+  void* staging = nullptr;
+  std::mutex staging_mu;
+  // The engine thread and the control thread enqueue onto the same stream;
+  // multi-op sequences (staged memcpy + nccl op per chunk) must be enqueued
+  // atomically or a concurrent sequence can interleave and corrupt staging.
+  std::mutex stream_mu[2];
 };
 
 struct NCCLEndpoint::AsyncHandle {
@@ -300,6 +327,16 @@ bool NCCLEndpoint::init_comms_(Conn& conn, ncclUniqueId const& uid_rank0,
   return true;
 }
 
+bool NCCLEndpoint::ensure_staging_(Conn& conn) {
+  std::lock_guard<std::mutex> lock(conn.staging_mu);
+  if (conn.staging) return true;
+  if (gpuSetDevice(conn.local_gpu_idx) != gpuSuccess) return false;
+  void* buf = nullptr;
+  if (gpuMalloc(&buf, kNcclStagingBytes) != gpuSuccess) return false;
+  conn.staging = buf;
+  return true;
+}
+
 void NCCLEndpoint::control_loop_(Conn* conn) {
   if (!conn) return;
   uint64_t writes_received = 0;
@@ -406,23 +443,55 @@ bool NCCLEndpoint::send_internal_(Conn& conn, void const* data, size_t size,
   if (!data) return false;
   if (comm_index < 0 || comm_index > 1) return false;
   if (!conn.comm[comm_index] || !conn.stream[comm_index]) return false;
-  if (!fence_default_stream(conn.local_gpu_idx, conn.stream[comm_index])) {
+
+  // Host memory is not GPU-visible; copy it into the device staging buffer
+  // first so NCCL's kernel reads device memory (see ptr_needs_staging).
+  bool const stage = ptr_needs_staging(data);
+  if (stage && !ensure_staging_(conn)) {
+    std::cerr << "[nccl] failed to allocate host-staging buffer" << std::endl;
     return false;
   }
-  // Enqueue NCCL send on the selected communicator/stream.
-  ncclResult_t rc = ncclSend(data, size, ncclChar, conn.remote_peer,
-                             conn.comm[comm_index], conn.stream[comm_index]);
-  if (rc != ncclSuccess) {
-    std::cerr << "[nccl] ncclSend failed: " << ncclGetErrorString(rc)
-              << std::endl;
+
+  gpuStream_t stream = conn.stream[comm_index];
+  // Serialize the whole enqueue sequence: the engine thread and the control
+  // thread share this stream, and interleaved chunked sequences would corrupt
+  // the shared staging buffer.
+  std::lock_guard<std::mutex> enqueue_lock(conn.stream_mu[comm_index]);
+  if (!fence_default_stream(conn.local_gpu_idx, stream)) {
     return false;
+  }
+
+  char const* cursor = static_cast<char const*>(data);
+  size_t left = size;
+  while (left > 0) {
+    size_t n = left;
+    void const* src = cursor;
+    if (stage) {
+      n = kNcclStagingBytes < left ? kNcclStagingBytes : left;
+      if (gpuMemcpyAsync(conn.staging, cursor, n, gpuMemcpyHostToDevice,
+                         stream) != gpuSuccess) {
+        return false;
+      }
+      src = conn.staging;
+    }
+    // Enqueue NCCL send on the selected communicator/stream. All chunks (and
+    // their staging copies) execute in stream order on a single stream.
+    ncclResult_t rc = ncclSend(src, n, ncclChar, conn.remote_peer,
+                               conn.comm[comm_index], stream);
+    if (rc != ncclSuccess) {
+      std::cerr << "[nccl] ncclSend failed: " << ncclGetErrorString(rc)
+                << std::endl;
+      return false;
+    }
+    cursor += n;
+    left -= n;
   }
 
   gpuEvent_t evt = nullptr;
   if (gpuEventCreateWithFlags(&evt, gpuEventDisableTiming) != gpuSuccess) {
     return false;
   }
-  if (gpuEventRecord(evt, conn.stream[comm_index]) != gpuSuccess) {
+  if (gpuEventRecord(evt, stream) != gpuSuccess) {
     gpuEventDestroy(evt);
     return false;
   }
@@ -446,23 +515,55 @@ bool NCCLEndpoint::recv_internal_(Conn& conn, void* data, size_t size,
   if (!data) return false;
   if (comm_index < 0 || comm_index > 1) return false;
   if (!conn.comm[comm_index] || !conn.stream[comm_index]) return false;
-  if (!fence_default_stream(conn.local_gpu_idx, conn.stream[comm_index])) {
+
+  // Host memory is not GPU-visible; recv into the device staging buffer and
+  // copy back out so NCCL's kernel only touches device memory.
+  bool const stage = ptr_needs_staging(data);
+  if (stage && !ensure_staging_(conn)) {
+    std::cerr << "[nccl] failed to allocate host-staging buffer" << std::endl;
     return false;
   }
-  // Enqueue NCCL recv on the selected communicator/stream.
-  ncclResult_t rc = ncclRecv(data, size, ncclChar, conn.remote_peer,
-                             conn.comm[comm_index], conn.stream[comm_index]);
-  if (rc != ncclSuccess) {
-    std::cerr << "[nccl] ncclRecv failed: " << ncclGetErrorString(rc)
-              << std::endl;
+
+  gpuStream_t stream = conn.stream[comm_index];
+  std::lock_guard<std::mutex> enqueue_lock(conn.stream_mu[comm_index]);
+  if (!fence_default_stream(conn.local_gpu_idx, stream)) {
     return false;
+  }
+
+  char* cursor = static_cast<char*>(data);
+  size_t left = size;
+  while (left > 0) {
+    size_t n = left;
+    void* dst = cursor;
+    if (stage) {
+      n = kNcclStagingBytes < left ? kNcclStagingBytes : left;
+      dst = conn.staging;
+    }
+    // Enqueue NCCL recv on the selected communicator/stream. Each chunk's
+    // device-to-host copy is stream-ordered behind the recv that filled the
+    // staging buffer, so reuse of the buffer is safe.
+    ncclResult_t rc = ncclRecv(dst, n, ncclChar, conn.remote_peer,
+                               conn.comm[comm_index], stream);
+    if (rc != ncclSuccess) {
+      std::cerr << "[nccl] ncclRecv failed: " << ncclGetErrorString(rc)
+                << std::endl;
+      return false;
+    }
+    if (stage) {
+      if (gpuMemcpyAsync(cursor, conn.staging, n, gpuMemcpyDeviceToHost,
+                         stream) != gpuSuccess) {
+        return false;
+      }
+    }
+    cursor += n;
+    left -= n;
   }
 
   gpuEvent_t evt = nullptr;
   if (gpuEventCreateWithFlags(&evt, gpuEventDisableTiming) != gpuSuccess) {
     return false;
   }
-  if (gpuEventRecord(evt, conn.stream[comm_index]) != gpuSuccess) {
+  if (gpuEventRecord(evt, stream) != gpuSuccess) {
     gpuEventDestroy(evt);
     return false;
   }
@@ -485,6 +586,10 @@ void NCCLEndpoint::cleanup_conn_(Conn& conn) {
     conn.ctrl_thread.join();
   }
   if (conn.local_gpu_idx >= 0) gpuSetDevice(conn.local_gpu_idx);
+  if (conn.staging) {
+    gpuFree(conn.staging);
+    conn.staging = nullptr;
+  }
   for (int i = 0; i < 2; ++i) {
     if (conn.stream[i]) {
       gpuStreamDestroy(conn.stream[i]);
