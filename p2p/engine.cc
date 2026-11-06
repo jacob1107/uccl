@@ -1515,7 +1515,12 @@ bool Endpoint::accept_local(std::string& remote_gpu_bdf, uint64_t& conn_id) {
   ShmMsg msg;
   while (true) {
     for (auto& [bdf, handle] : inbox_rings_) {
-      if (bdf == gpu_bus_id_) continue;
+      // The own-BDF ring only carries CONNECTs from a peer process sharing
+      // this GPU. With a network path those peers are routed to the network
+      // transport, so the ring is never polled; in IPC-only mode
+      // (UCCL_P2P_ALLOW_NO_NIC=1, no RDMA device) there is no network path
+      // and skipping the ring would hang the accept forever.
+      if (bdf == gpu_bus_id_ && endpoint_has_network(ep_)) continue;
       if (handle.ring == nullptr) continue;
 
       if (!jring_empty(handle.ring)) {
@@ -2584,7 +2589,8 @@ void Endpoint::passive_accept_local_thread_func() {
   while (!passive_accept_stop_.load(std::memory_order_acquire)) {
     bool found = false;
     for (auto& [bdf, handle] : inbox_rings_) {
-      if (bdf == gpu_bus_id_) continue;
+      // See accept_local: poll the own-BDF ring only in IPC-only mode.
+      if (bdf == gpu_bus_id_ && endpoint_has_network(ep_)) continue;
       if (handle.ring == nullptr) continue;
       if (jring_empty(handle.ring)) continue;
 

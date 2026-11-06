@@ -74,13 +74,15 @@ bool RDMAEndpoint::initialize_rdma_ctx_for_gpu(
     if (no_nic_mode_enabled()) {
       // IPC-only mode: keep contexts_ empty and let the engine come up so
       // same-node IPC transfers work. uccl_connect()/process_meta() reject
-      // every network-path operation while contexts_ is empty.
+      // every network-path operation while contexts_ is empty. Same-node
+      // cross-process peers (including same-GPU) use shm IPC + CUDA IPC, and
+      // host-memory peers fall back to process_vm.
       UCCL_LOG(WARN)
           << "No RDMA device found for GPU " << gpu_index
           << " and UCCL_P2P_ALLOW_NO_NIC=1 is set; continuing in IPC-only "
              "mode. Only same-node IPC transfers are available; network "
-             "transfers (inter-node, loopback, same-GPU cross-process) and "
-             "host-to-host transfers will fail.";
+             "transfers (inter-node, loopback) and host-to-host transfers "
+             "will fail.";
       return true;
     }
     std::string msg = "No RDMA device found for GPU " +

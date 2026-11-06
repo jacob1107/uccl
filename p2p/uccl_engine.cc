@@ -433,6 +433,9 @@ uccl_conn_t* uccl_engine_connect(uccl_engine_t* engine, char const* ip_addr,
   //   - Same-process: IPC (direct ring access)
   //   - Cross-process diff-GPU same-node: IPC
   //   - Cross-process same-GPU same-node: network (shm ring self-skip issue)
+  //     EXCEPT in IPC-only mode (UCCL_P2P_ALLOW_NO_NIC=1, no RDMA device):
+  //     the network path does not exist, so route through shm IPC as well;
+  //     accept_local polls the own-BDF ring in that mode.
   //   - Remote inter-node: network (RDMA)
   //
   // NCCL build:
@@ -444,8 +447,13 @@ uccl_conn_t* uccl_engine_connect(uccl_engine_t* engine, char const* ip_addr,
   //   - Remote inter-node: network (NCCL)
   bool use_ipc;
   if (!is_nccl_transport()) {
-    use_ipc = is_local && (same_process ||
-                           remote_bdf != engine->endpoint->get_gpu_bus_id());
+    // Live check (not the cached flag): a remote_bdf equal to our own
+    // implies the engine is initialized, so this is accurate exactly when
+    // the third clause is reached.
+    bool ipc_only = !endpoint_has_network(engine->endpoint->get_endpoint());
+    use_ipc = is_local &&
+              (same_process ||
+               remote_bdf != engine->endpoint->get_gpu_bus_id() || ipc_only);
   } else {
     use_ipc = is_local && same_process;
   }
