@@ -165,7 +165,7 @@ torchrun --nnodes=2 --nproc_per_node=1 --node-rank=1 --master_addr=<IP addr> ben
 Notes: 
 * You may consider exporting `GLOO_SOCKET_IFNAME=xxx NCCL_SOCKET_IFNAME=xxx` if triggering Gloo connectFullMesh failure.
 * You may consider exporting `UCCL_P2P_RDMA_GID_INDEX` if your cluster requires it for NCCL to run (usually 1, or 3 in some testbed).
-* You can specify `UCCL_P2P_TRANSPORT=ib|efa|cxi` at runtime to choose different network backends. The default is `ib` that works for NVIDIA, Broadcom, AMD, and Intel RDMA NICs.
+* You can specify `UCCL_P2P_TRANSPORT=ib|efa|cxi` at runtime to choose different network backends. The default is `ib` that works for NVIDIA, Broadcom, AMD, and Intel RDMA NICs. Any other value (including the removed `nccl`/`tcp`/`tcpx`) aborts at startup instead of silently falling back to `ib`.
 * **You must first import `torch` before importing `uccl.p2p` for AMD GPUs**, otherwise, `RuntimeError: No HIP GPUs are available` will occur. We guess this is because torch does some extra init for AMD GPUs, in order for Pybind-C++ code to work. 
 * One-sided network write is the default in `benchmark_uccl.py`; use `--mode read` for RDMA read.
 * To benchmark one-sided IPC write (GPU-to-GPU or CPU-to-GPU), `torchrun --nproc_per_node=2 benchmarks/benchmark_uccl.py --write-ipc`. Use `--device cpu --pinned` for CPU source buffers.
@@ -181,7 +181,7 @@ Notes:
 | UCCL_P2P_RDMA_TC | Traffic class in RDMA network | 104 (IB) |
 | UCCL_P2P_RDMA_DEV | RDMA devices forced to use (instead of auto-selecting based on PCIe affinity) | none (eg, `irdma-mkp0,irdma-mkp1`) |
 | UCCL_P2P_RDMA_RELAXED_ORDERING | PCIe relaxed ordering on RDMA memory registrations (`IBV_ACCESS_RELAXED_ORDERING`); set `0` to disable. Without it GPUDirect RDMA on IOMMU-remapped VMs can cap well below line rate | 1 (enabled) |
-| UCCL_P2P_TRANSPORT | Network backend to use at runtime | ib (others: efa/cxi) |
+| UCCL_P2P_TRANSPORT | Network backend to use at runtime; unrecognized values abort at startup | ib (others: efa/cxi) |
 | UCCL_P2P_ALLOW_NO_NIC | Let the `ib` backend start on hosts with no RDMA device (IPC-only mode): same-node IPC transfers work (cross-process peers on the same GPU included, via shm IPC), host-memory targets fall back to `process_vm_writev/readv` (peer pid exchanged over OOB; GPU buffers bounce through host staging), every network-path operation (inter-node, loopback) fails fast | 0 (disabled) |
 | UCCL_CXI_DOMAIN | CXI/libfabric domain to use when `UCCL_P2P_TRANSPORT=cxi` | auto from GPU index, eg `cxi0` |
 | UCCL_CXI_DEVICE_INDEX | CXI device index used for automatic domain selection | GPU index modulo 4 |

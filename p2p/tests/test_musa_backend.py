@@ -200,6 +200,9 @@ int main() {
             "cxi",
             "typo",
             "",
+            "nccl",
+            "tcp",
+            "tcpx",
         ):
             with self.subTest(transport=name):
                 env = os.environ.copy()

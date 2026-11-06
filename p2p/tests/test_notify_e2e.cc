@@ -7,8 +7,8 @@
 //   server: ./notif_e2e server
 //   client: ./notif_e2e client <ip> <port>
 //
-// Run with UCCL_P2P_TRANSPORT=tcp UCCL_P2P_DISABLE_IPC=1 so a localhost pair
-// takes the network path instead of the IPC shortcut.
+// Run with UCCL_P2P_TRANSPORT=ib UCCL_P2P_DISABLE_IPC=1 so a localhost pair
+// takes the network (RDMA loopback) path instead of the IPC shortcut.
 #include "uccl_engine.h"
 #include <chrono>
 #include <cstdio>

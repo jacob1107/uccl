@@ -90,9 +90,7 @@ class TransportFactoryTests(unittest.TestCase):
                 command, input=source, text=True, capture_output=True, timeout=30
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            transports = (
-                ("rdma", "ib") if musa else ("rdma", "ib", "efa", "cxi", "unknown")
-            )
+            transports = ("rdma", "ib") if musa else ("rdma", "ib", "efa", "cxi")
             for transport in (None, *transports):
                 with self.subTest(musa=musa, transport=transport):
                     env = dict(os.environ)
@@ -103,6 +101,50 @@ class TransportFactoryTests(unittest.TestCase):
                         [str(exe)], env=env, text=True, capture_output=True, timeout=10
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_unknown_transport_value_fails_fast(self):
+        # Typos and removed backends (nccl/tcp) must abort instead of
+        # silently running the default RDMA/IPC endpoint.
+        source = r"""
+#include <iostream>
+#include "util/transport_type.h"
+int main() {
+  std::cout << static_cast<int>(get_transport_type());
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            exe = Path(directory) / "test"
+            compile = subprocess.run(
+                [
+                    os.environ.get("CXX", "c++"),
+                    "-std=c++17",
+                    "-I",
+                    str(ROOT / "p2p"),
+                    "-x",
+                    "c++",
+                    "-",
+                    "-o",
+                    str(exe),
+                ],
+                input=source,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(compile.returncode, 0, compile.stderr)
+            for transport in ("unknown", "nccl", "tcp", "tcpx", ""):
+                with self.subTest(transport=transport):
+                    env = dict(os.environ)
+                    env["UCCL_P2P_TRANSPORT"] = transport
+                    result = subprocess.run(
+                        [str(exe)],
+                        env=env,
+                        text=True,
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("Unsupported UCCL_P2P_TRANSPORT", result.stderr)
 
     def test_factory_selects_type_and_preserves_eager_and_lazy_arguments(self):
         source = r"""
