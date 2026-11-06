@@ -2485,7 +2485,9 @@ void Endpoint::initialize_engine() {
 }
 
 void Endpoint::send_proxy_thread_func() {
-  uccl::pin_thread_to_numa(numa_node_);
+  // numa_node_ < 0 (e.g. no RDMA NIC on this host): leave threads unpinned
+  // instead of logging an error for every proxy thread.
+  if (numa_node_ >= 0) uccl::pin_thread_to_numa(numa_node_);
   // Use 16-byte buffer to avoid stringop-overflow warning from jring's 16-byte
   // bulk copy
   alignas(16) char task_buffer[16];
@@ -2526,7 +2528,7 @@ void Endpoint::send_proxy_thread_func() {
 }
 
 void Endpoint::recv_proxy_thread_func() {
-  uccl::pin_thread_to_numa(numa_node_);
+  if (numa_node_ >= 0) uccl::pin_thread_to_numa(numa_node_);
   // Use 16-byte buffer to avoid stringop-overflow warning from jring's 16-byte
   // bulk copy
   alignas(16) char task_buffer[16];
@@ -2599,7 +2601,7 @@ void Endpoint::passive_accept_local_thread_func() {
 }
 
 void Endpoint::ipc_poller_thread_func() {
-  uccl::pin_thread_to_numa(numa_node_);
+  if (numa_node_ >= 0) uccl::pin_thread_to_numa(numa_node_);
   std::deque<IpcInflightOp*> active_ops;
   alignas(16) char buf[16];
   int cur_device = -1;
