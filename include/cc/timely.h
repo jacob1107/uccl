@@ -10,7 +10,14 @@
 #include "util/latency.h"
 #include "util/timer.h"
 #include "util/util.h"
+// This header uses no verbs types; the include is kept for verbs builds only
+// so transitive consumers keep seeing it (see cc/link_bandwidth.h).
+#ifndef UCCL_P2P_ENABLE_RDMA
+#define UCCL_P2P_ENABLE_RDMA 1
+#endif
+#if UCCL_P2P_ENABLE_RDMA
 #include <infiniband/verbs.h>
+#endif
 #include <iomanip>
 
 /**
