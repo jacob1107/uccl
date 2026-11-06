@@ -164,6 +164,7 @@ Notes:
 | UCCL_P2P_RDMA_DEV | RDMA devices forced to use (instead of auto-selecting based on PCIe affinity) | none (eg, `irdma-mkp0,irdma-mkp1`) |
 | UCCL_P2P_RDMA_RELAXED_ORDERING | PCIe relaxed ordering on RDMA memory registrations (`IBV_ACCESS_RELAXED_ORDERING`); set `0` to disable. Without it GPUDirect RDMA on IOMMU-remapped VMs can cap well below line rate | 1 (enabled) |
 | UCCL_P2P_TRANSPORT | Network backend to use at runtime | ib (others: efa/nccl/tcp/tcpx/cxi) |
+| UCCL_P2P_ALLOW_NO_NIC | Let the `ib` backend start on hosts with no RDMA device (IPC-only mode): same-node IPC transfers work, every network-path operation (inter-node, loopback, same-GPU cross-process, host-to-host) fails fast | 0 (disabled) |
 | UCCL_CXI_DOMAIN | CXI/libfabric domain to use when `UCCL_P2P_TRANSPORT=cxi` | auto from GPU index, eg `cxi0` |
 | UCCL_CXI_DEVICE_INDEX | CXI device index used for automatic domain selection | GPU index modulo 4 |
 | UCCL_CXI_THREADING | libfabric threading hint for the CXI domain (`endpoint` is rejected by libfabric >= 2.x CXI) | safe |

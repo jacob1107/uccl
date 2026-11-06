@@ -2,6 +2,20 @@
 #include "util/debug.h"
 #include "util/gpu_rt.h"
 #include "util/util.h"
+#include <cstdlib>
+#include <cstring>
+
+namespace {
+// UCCL_P2P_ALLOW_NO_NIC=1 lets the engine start on hosts with no RDMA device.
+// In this mode contexts_ stays empty: only same-node IPC transfers work
+// (same-process, and cross-process between different GPUs). Every
+// network-path operation (inter-node, loopback, same-GPU cross-process,
+// host-to-host) fails fast with a clear error instead of hanging the peer.
+bool no_nic_mode_enabled() {
+  char const* val = std::getenv("UCCL_P2P_ALLOW_NO_NIC");
+  return val && std::strcmp(val, "1") == 0;
+}
+}  // namespace
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 RDMAEndpoint::RDMAEndpoint(int gpu_index, uint64_t port,
@@ -56,11 +70,24 @@ bool RDMAEndpoint::initialize_rdma_ctx_for_gpu(
   // error the caller can see instead of tripping the assert in
   // initialize_contexts (or dividing by zero there when asserts are off).
   if (actual_device_ids.empty()) {
+    if (no_nic_mode_enabled()) {
+      // IPC-only mode: keep contexts_ empty and let the engine come up so
+      // same-node IPC transfers work. uccl_connect()/process_meta() reject
+      // every network-path operation while contexts_ is empty.
+      UCCL_LOG(WARN)
+          << "No RDMA device found for GPU " << gpu_index
+          << " and UCCL_P2P_ALLOW_NO_NIC=1 is set; continuing in IPC-only "
+             "mode. Only same-node IPC transfers are available; network "
+             "transfers (inter-node, loopback, same-GPU cross-process) and "
+             "host-to-host transfers will fail.";
+      return true;
+    }
     std::string msg = "No RDMA device found for GPU " +
                       std::to_string(gpu_index) +
                       "; select one with UCCL_P2P_RDMA_DEV";
     if (UCCL_P2P_ENABLE_NCCL)
       msg += ", or set UCCL_P2P_TRANSPORT=nccl on hosts without RDMA NICs";
+    msg += ", or set UCCL_P2P_ALLOW_NO_NIC=1 for same-node IPC-only mode";
     UCCL_LOG(ERROR) << msg;
     throw std::runtime_error(msg);
   }
@@ -333,6 +360,20 @@ std::string RDMAEndpoint::get_oob_conn_key(uint64_t peer_id) {
 
 ConnID RDMAEndpoint::uccl_connect(int remote_gpuidx, std::string remote_ip,
                                   uint16_t remote_port) {
+  // IPC-only mode (no RDMA device): fail fast before any OOB handshake so the
+  // caller sees a clean error and the peer never ends up waiting for channel
+  // metadata that will not arrive. Callers reject peer_id == UINT64_MAX.
+  if (contexts_.empty()) {
+    UCCL_LOG(ERROR)
+        << "uccl_connect: no RDMA context on this host (no RDMA device); "
+           "network connections are unavailable. Only same-node IPC "
+           "transfers work without an RDMA device; use "
+           "UCCL_P2P_TRANSPORT=nccl or soft-RoCE for network transfers.";
+    ConnID invalid{};
+    invalid.peer_id = UINT64_MAX;
+    return invalid;
+  }
+
   int32_t current_send_peer_id =
       next_send_peer_id_.fetch_add(1, std::memory_order_relaxed);
 
@@ -603,6 +644,19 @@ void RDMAEndpoint::process_meta(std::string const& input, std::string& output,
   MetaInfoToExchange meta = deserialize<MetaInfoToExchange>(input);
   UCCL_LOG(INFO, UCCL_RDMA)
       << "Received from " << client_ip << ":" << client_port << " - " << meta;
+
+  // IPC-only mode: a channel handshake below would index contexts_[...] on an
+  // empty vector. Reject loudly instead of corrupting memory. (Notifications
+  // were already handled above; local IPC connections still work.)
+  if (contexts_.empty()) {
+    UCCL_LOG(ERROR)
+        << "process_meta: got a channel request from " << client_ip << ":"
+        << client_port
+        << " but this endpoint has no RDMA context (no RDMA device, "
+           "UCCL_P2P_ALLOW_NO_NIC=1); rejecting the connection";
+    throw std::runtime_error(
+        "RDMA channel request on an IPC-only endpoint (no RDMA device)");
+  }
 
   auto context_id = channel_id_to_context_id(meta.channel_id);
   std::shared_ptr<RdmaContext> ctx_ptr = contexts_[context_id];

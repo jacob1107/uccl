@@ -57,8 +57,12 @@ struct EndpointOps<RDMAEndpoint> : DirectEndpointOps<RDMAEndpoint> {
 
   static int uccl_get_numa_node(std::shared_ptr<RDMAEndpoint> const& s,
                                 int gpu_idx) {
-    return RdmaDeviceManager::instance().get_numa_node(
-        RdmaDeviceManager::instance().get_best_dev_idx(gpu_idx)[0]);
+    (void)s;
+    // get_best_dev_idx() returns an empty vector on hosts without an RDMA
+    // NIC; indexing [0] there is UB. Leave threads unpinned instead.
+    auto dev_ids = RdmaDeviceManager::instance().get_best_dev_idx(gpu_idx);
+    if (dev_ids.empty()) return -1;
+    return RdmaDeviceManager::instance().get_numa_node(dev_ids[0]);
   }
 
   static int uccl_send_notification(std::shared_ptr<RDMAEndpoint> const& s,
