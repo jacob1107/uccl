@@ -125,12 +125,24 @@ $(BUILD_DIR)/nanobind/%.o: $(NB_SRC_DIR)/%.cpp $(BUILD_DIR)/config
 
 -include $(CORE_OBJECTS:.o=.d) $(API_OBJECTS:.o=.d) $(NB_OBJECTS:.o=.d)
 
+# A verbs-free build (ENABLE_RDMA=0) must install a header whose #ifndef
+# default matches the library it ships: consumers of the installed engine
+# (e.g. NIXL's UCCL plugin, via uccl_engine.h -> common.h) do not define
+# UCCL_P2P_ENABLE_RDMA, so the source-tree default of 1 makes them include
+# <infiniband/efadv.h> (missing on verbs-free hosts) and compile against the
+# verbs type aliases while libuccl_p2p.so was built with the verbs-free ones.
+# Only the installed copy is stamped; the source tree, verbs installs, and
+# explicit -D consumer overrides are unchanged.
 install: all
 	install -d $(INSTALL_DIR) $(LIBDIR) $(INCDIR)
 	rm -f $(INSTALL_DIR)/p2p.so $(INSTALL_DIR)/p2p.abi3.so $(INSTALL_DIR)/p2p.cpython-*.so
 	install -m 755 $(P2P_PYTHON_EXT) $(INSTALL_DIR)/
 	install -m 755 $(P2P_SHARED_LIB) $(LIBDIR)/
 	install -m 644 uccl_engine.h util/common.h $(INCDIR)/
+ifeq ($(ENABLE_RDMA),0)
+	sed -i 's/^#define UCCL_P2P_ENABLE_RDMA 1$$/#define UCCL_P2P_ENABLE_RDMA 0/' $(INCDIR)/common.h
+	grep -qx '#define UCCL_P2P_ENABLE_RDMA 0' $(INCDIR)/common.h || { echo "ERROR: $(INCDIR)/common.h default was not stamped to 0; did util/common.h's #ifndef default line change?" >&2; exit 1; }
+endif
 
 clean:
 	rm -f $(CORE_OBJECTS) $(API_OBJECTS) $(NB_OBJECTS)
