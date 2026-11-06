@@ -134,6 +134,8 @@ class RDMAEndpoint {
   // ── Active-side connection handshake (outbound) ────────────────────────────
   std::string const build_oob_connect(uint64_t peer_id);
 
+  int build_connect(uint64_t peer_id, bool sync = true, int timeout_ms = 10000);
+
   int build_control_channel(std::string const& oob_con, uint64_t peer_id,
                             bool sync = true, int timeout_ms = 10000);
 

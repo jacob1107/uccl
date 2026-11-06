@@ -120,8 +120,8 @@ bool RDMAEndpoint::initialize_rdma_ctx_for_gpu(
 #endif  // UCCL_P2P_ENABLE_RDMA
 }
 
-void RDMAEndpoint::initialize_contexts(std::vector<size_t> const& device_ids) {
 #if UCCL_P2P_ENABLE_RDMA
+void RDMAEndpoint::initialize_contexts(std::vector<size_t> const& device_ids) {
   auto& device_manager = RdmaDeviceManager::instance();
   assert(!device_ids.empty() && device_ids.size() <= kNICContextNumber);
 
@@ -167,10 +167,8 @@ void RDMAEndpoint::initialize_contexts(std::vector<size_t> const& device_ids) {
   UCCL_LOG(INFO, UCCL_RDMA)
       << "RDMAEndpoint: " << kNICContextNumber << " context slots, "
       << unique_count << " unique device(s)";
-#else
-  (void)device_ids;  // no RDMA stack in verbs-free builds
-#endif
 }
+#endif  // UCCL_P2P_ENABLE_RDMA
 
 #if UCCL_P2P_ENABLE_RDMA
 std::shared_ptr<RdmaContext> RDMAEndpoint::get_context_by_channel_id(
