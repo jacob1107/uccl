@@ -1,3 +1,6 @@
+// Must precede all includes: process_vm_writev/readv declarations in
+// <sys/uio.h> are glibc __USE_GNU-only, and the build uses -std=c++17.
+#define _GNU_SOURCE
 #include "uccl_engine.h"
 #include "endpoint_wrapper.h"
 #include "engine.h"
@@ -7,8 +10,11 @@
 #include "util/gpu_rt.h"
 #include "util/util.h"
 #include <arpa/inet.h>
+#include <sys/uio.h>
+#include <unistd.h>
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdbool>
@@ -51,6 +57,10 @@ struct uccl_conn {
   std::mutex listener_mutex;
   bool is_local = false;      // True for intra-node (IPC) connections
   bool same_process = false;  // True for same-process local transfers
+  // Peer OS pid for local cross-process connections, exchanged over OOB the
+  // first time a host-memory (no-IPC-handle) transfer needs the process_vm
+  // fallback. -1 = not yet exchanged.
+  pid_t peer_pid = -1;
 };
 
 typedef struct {
@@ -125,6 +135,248 @@ static bool ipc_disabled() {
     return dis;
   }();
   return disabled;
+}
+
+// ---------------------------------------------------------------------------
+// Host-memory fallback for IPC-only mode (UCCL_P2P_ALLOW_NO_NIC=1, no RDMA
+// device). CUDA IPC handles only exist for device memory, so a local
+// transfer whose REMOTE descriptor is host memory has no data path when the
+// transport has no network (empty RDMA contexts). Route those through
+// process_vm_writev/readv against the peer's pid; GPU-side buffers bounce
+// through a host staging buffer since process_vm_* require user-space
+// addresses on the local side.
+// ---------------------------------------------------------------------------
+
+static size_t const kVmFallbackChunk = 8ul << 20;  // 8 MiB staging chunks
+
+// True when this transfer must use the process_vm fallback: local peer, the
+// remote descriptor carries no IPC handle (host memory), and the transport
+// backend has no network data path.
+static bool use_vm_fallback(uccl_conn_t const* conn, int num_iovs,
+                            std::vector<char*> const& ipc_bufs) {
+  if (!(conn->is_local || conn->same_process)) return false;
+  if (!ipc_bufs.empty()) return false;  // remote is GPU memory: IPC path
+  // All iovs must agree on the fallback (empty ipc_bufs means none had one).
+  (void)num_iovs;
+  return !endpoint_has_network(conn->engine->endpoint->get_endpoint());
+}
+
+// Exchange our pid for the peer's over the OOB channel. The peer's
+// RDMAEndpoint::process_meta answers "UCCL_PID_REQ:<pid>" with
+// "UCCL_PID_RSP:<pid>". Idempotent; returns -1 on failure.
+static pid_t exchange_peer_pid(uccl_engine_t* engine, uccl_conn_t* conn) {
+  if (conn->peer_pid > 0) return conn->peer_pid;
+  if (conn->same_process) {
+    conn->peer_pid = getpid();
+    return conn->peer_pid;
+  }
+  auto oob_client = engine->endpoint->get_oob_client();
+  if (!oob_client) oob_client = engine->local_oob_client;
+  if (!oob_client || conn->oob_conn_key.empty()) {
+    UCCL_LOG(ERROR) << "VM fallback: no OOB channel to peer for PID exchange";
+    return -1;
+  }
+
+  std::promise<std::string> rsp_promise;
+  auto rsp_future = rsp_promise.get_future();
+  std::string req =
+      "UCCL_PID_REQ:" + std::to_string(static_cast<long>(getpid()));
+  bool sent = oob_client->send_meta(conn->oob_conn_key, req,
+                                    [&](std::string const& resp) {
+                                      try {
+                                        rsp_promise.set_value(resp);
+                                      } catch (...) {
+                                      }
+                                    });
+  if (!sent) {
+    UCCL_LOG(ERROR) << "VM fallback: failed to send PID request";
+    return -1;
+  }
+  if (rsp_future.wait_for(std::chrono::seconds(10)) !=
+      std::future_status::ready) {
+    UCCL_LOG(ERROR) << "VM fallback: PID exchange timed out";
+    return -1;
+  }
+  std::string const& resp = rsp_future.get();
+  static std::string const kPidRsp = "UCCL_PID_RSP:";
+  if (resp.rfind(kPidRsp, 0) != 0) {
+    UCCL_LOG(ERROR) << "VM fallback: malformed PID response: " << resp;
+    return -1;
+  }
+  long pid = std::strtol(resp.c_str() + kPidRsp.size(), nullptr, 10);
+  if (pid <= 0) {
+    UCCL_LOG(ERROR) << "VM fallback: invalid peer pid in response: " << resp;
+    return -1;
+  }
+  conn->peer_pid = static_cast<pid_t>(pid);
+  UCCL_LOG(INFO, UCCL_P2P) << "VM fallback: peer pid is " << conn->peer_pid;
+  return conn->peer_pid;
+}
+
+// process_vm_writev/readv with EINTR and partial-transfer handling.
+static bool process_vm_xfer(pid_t peer_pid, bool is_write, void* local,
+                            const void* remote, size_t size) {
+  struct iovec liov{local, size};
+  struct iovec riov{const_cast<void*>(remote), size};
+  size_t done = 0;
+  while (done < size) {
+    liov.iov_len = size - done;
+    riov.iov_len = size - done;
+    ssize_t n = -1;
+    if (is_write) {
+      n = process_vm_writev(peer_pid, &liov, 1, &riov, 1, 0);
+    } else {
+      n = process_vm_readv(peer_pid, &liov, 1, &riov, 1, 0);
+    }
+    if (n > 0) {
+      done += n;
+      liov.iov_base = static_cast<char*>(liov.iov_base) + n;
+      riov.iov_base = static_cast<char*>(riov.iov_base) + n;
+      continue;
+    }
+    if (n < 0 && errno == EINTR) continue;
+    int err = (n == 0) ? EIO : errno;
+    UCCL_LOG(ERROR) << "VM fallback: process_vm_"
+                    << (is_write ? "writev" : "readv") << " stopped at offset "
+                    << done << "/" << size
+                    << (n == 0 ? " (zero-byte transfer, remote region too "
+                                 "small or unmapped)"
+                               : std::string(": ") + std::strerror(err));
+    if (err == EPERM || err == EACCES) {
+      UCCL_LOG(ERROR)
+          << "VM fallback: permission denied talking to pid " << peer_pid
+          << "; processes must share uid (or run with CAP_SYS_PTRACE; plain "
+             "root in Docker works, adding SYS_PTRACE capability is the fix "
+             "for restricted containers)";
+    } else if (err == ESRCH) {
+      UCCL_LOG(ERROR) << "VM fallback: peer pid " << peer_pid
+                      << " does not exist (peer restarted?)";
+    }
+    return false;
+  }
+  return true;
+}
+
+// A TransferStatus already marked done: poll_async() will observe done,
+// report success and free it.
+static uint64_t make_completed_transfer(bool success) {
+  auto* st = new TransferStatus;
+  st->success = success;
+  st->done.store(true, std::memory_order_release);
+  return reinterpret_cast<uint64_t>(st);
+}
+
+// Copy within this process, host<->host (memcpy) or host<->device
+// (gpuMemcpy on the buffer's device). Direction is implied by which side is
+// device memory.
+static bool local_copy_buf(void* dst, void const* src, size_t size) {
+  int dst_dev = uccl::get_dev_idx(dst);
+  int src_dev = uccl::get_dev_idx(const_cast<void*>(src));
+  if (dst_dev < 0 && src_dev < 0) {
+    std::memcpy(dst, src, size);
+    return true;
+  }
+  gpuError_t err;
+  if (dst_dev >= 0) {
+    gpuSetDevice(dst_dev);
+    err = gpuMemcpy(dst, src, size, gpuMemcpyHostToDevice);
+  } else {
+    gpuSetDevice(src_dev);
+    err = gpuMemcpy(dst, src, size, gpuMemcpyDeviceToHost);
+  }
+  if (err != gpuSuccess) {
+    UCCL_LOG(ERROR) << "VM fallback: local gpuMemcpy failed: " << err;
+    return false;
+  }
+  return true;
+}
+
+// WRITE: push each local buffer (dst_v[i] = local source) to the peer's host
+// buffer at fifo_items[i].addr. GPU sources stage D2H first. Synchronous;
+// on success *transfer_id is a completed transfer.
+static int host_vm_write_vector(uccl_conn_t* conn,
+                                std::vector<void*> const& src_v,
+                                std::vector<size_t> const& size_v,
+                                std::vector<FifoItem> const& fifo_items,
+                                int num_iovs, uint64_t* transfer_id) {
+  pid_t peer = exchange_peer_pid(conn->engine, conn);
+  if (peer <= 0) return -1;
+  std::vector<uint8_t> staging;
+  for (int i = 0; i < num_iovs; i++) {
+    void* src = src_v[i];
+    size_t size = size_v[i];
+    void* remote = reinterpret_cast<void*>(fifo_items[i].addr);
+    if (conn->same_process) {
+      if (!local_copy_buf(remote, src, size)) return -1;
+      continue;
+    }
+    int src_dev = uccl::get_dev_idx(src);
+    if (src_dev < 0) {
+      if (!process_vm_xfer(peer, true, src, remote, size)) return -1;
+    } else {
+      staging.resize(std::min(size, kVmFallbackChunk));
+      gpuSetDevice(src_dev);
+      size_t off = 0;
+      while (off < size) {
+        size_t chunk = std::min(size - off, staging.size());
+        if (gpuMemcpy(staging.data(), static_cast<char const*>(src) + off,
+                      chunk, gpuMemcpyDeviceToHost) != gpuSuccess) {
+          UCCL_LOG(ERROR) << "VM fallback: D2H staging copy failed";
+          return -1;
+        }
+        if (!process_vm_xfer(peer, true, staging.data(),
+                             static_cast<char*>(remote) + off, chunk))
+          return -1;
+        off += chunk;
+      }
+    }
+  }
+  if (transfer_id) *transfer_id = make_completed_transfer(true);
+  return 0;
+}
+
+// READ: pull each peer host buffer at fifo_items[i].addr into the local
+// buffer dst_v[i]. GPU destinations stage H2D afterwards. Synchronous; on
+// success *transfer_id is a completed transfer.
+static int host_vm_read_vector(uccl_conn_t* conn,
+                               std::vector<void*> const& dst_v,
+                               std::vector<size_t> const& size_v,
+                               std::vector<FifoItem> const& fifo_items,
+                               int num_iovs, uint64_t* transfer_id) {
+  pid_t peer = exchange_peer_pid(conn->engine, conn);
+  if (peer <= 0) return -1;
+  std::vector<uint8_t> staging;
+  for (int i = 0; i < num_iovs; i++) {
+    void* dst = dst_v[i];
+    size_t size = size_v[i];
+    void* remote = reinterpret_cast<void*>(fifo_items[i].addr);
+    if (conn->same_process) {
+      if (!local_copy_buf(dst, remote, size)) return -1;
+      continue;
+    }
+    int dst_dev = uccl::get_dev_idx(dst);
+    if (dst_dev < 0) {
+      if (!process_vm_xfer(peer, false, dst, remote, size)) return -1;
+    } else {
+      staging.resize(std::min(size, kVmFallbackChunk));
+      gpuSetDevice(dst_dev);
+      size_t off = 0;
+      while (off < size) {
+        size_t chunk = std::min(size - off, staging.size());
+        if (!process_vm_xfer(peer, false, staging.data(),
+                             static_cast<char*>(remote) + off, chunk))
+          return -1;
+        if (gpuMemcpy(static_cast<char*>(dst) + off, staging.data(), chunk,
+                      gpuMemcpyHostToDevice) != gpuSuccess) {
+          UCCL_LOG(ERROR) << "VM fallback: H2D staging copy failed";
+          return -1;
+        }
+        off += chunk;
+      }
+    }
+  }
+  if (transfer_id) *transfer_id = make_completed_transfer(true);
+  return 0;
 }
 
 uccl_engine_t* uccl_engine_create(int num_cpus, bool in_python) {
@@ -365,6 +617,12 @@ int uccl_engine_read_vector(uccl_conn_t* conn, std::vector<uccl_mr_t> mr_ids,
                : -1;
   }
 
+  // IPC-only mode with a host-memory remote descriptor: process_vm fallback.
+  if (use_vm_fallback(conn, num_iovs, ipc_bufs)) {
+    return host_vm_read_vector(conn, dst_v, size_v, fifo_items, num_iovs,
+                               transfer_id);
+  }
+
   // Remote RDMA
   return conn->engine->endpoint->readv_async(conn->conn_id, mr_ids, dst_v,
                                              size_v, fifo_items, num_iovs,
@@ -465,6 +723,12 @@ int uccl_engine_write_vector(uccl_conn_t* conn, std::vector<uccl_mr_t> mr_ids,
                conn->conn_id, src_v, size_v, info_v, num_iovs, transfer_id)
                ? 0
                : -1;
+  }
+
+  // IPC-only mode with a host-memory remote descriptor: process_vm fallback.
+  if (use_vm_fallback(conn, num_iovs, ipc_bufs)) {
+    return host_vm_write_vector(conn, dst_v, size_v, fifo_items, num_iovs,
+                                transfer_id);
   }
 
   // Remote RDMA

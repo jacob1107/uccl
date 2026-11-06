@@ -230,6 +230,22 @@ inline bool initialize_rdma_ctx_for_gpu(GenericEndpoint const& ep, int dev) {
       ep);
 }
 
+// Whether a network data path exists. Only the RDMA backend can run without
+// one: in IPC-only mode (UCCL_P2P_ALLOW_NO_NIC=1 on a host with no RDMA
+// device) its contexts stay empty and every network transfer is rejected.
+inline bool endpoint_has_network(GenericEndpoint const& ep) {
+  return std::visit(
+      [](auto const& s) -> bool {
+        using T = std::decay_t<decltype(*s)>;
+        if constexpr (std::is_same_v<T, RDMAEndpoint>) {
+          return s->context_count() != 0;
+        } else {
+          return true;
+        }
+      },
+      ep);
+}
+
 inline void create_unified_p2p_socket(GenericEndpoint const& ep) {
   return std::visit(
       [&](auto const& s) {

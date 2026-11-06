@@ -4,6 +4,7 @@
 #include "util/util.h"
 #include <cstdlib>
 #include <cstring>
+#include <unistd.h>
 
 namespace {
 // UCCL_P2P_ALLOW_NO_NIC=1 lets the engine start on hosts with no RDMA device.
@@ -637,6 +638,18 @@ void RDMAEndpoint::process_meta(std::string const& input, std::string& output,
       std::lock_guard<std::mutex> lock(notify_mutex);
       notify_list.push_back(std::move(notify_msg));
       output = "";
+      return;
+    }
+  }
+
+  // PID exchange for the local host-memory fallback (process_vm path): the
+  // peer asks for our pid over OOB. Must run before the channel-meta
+  // deserialization below (which would throw on this string) and works with
+  // or without RDMA contexts.
+  {
+    static std::string const kPidReq = "UCCL_PID_REQ:";
+    if (input.rfind(kPidReq, 0) == 0) {
+      output = "UCCL_PID_RSP:" + std::to_string(static_cast<long>(getpid()));
       return;
     }
   }
