@@ -2,9 +2,6 @@
 #include "engine.h"
 #include "transport/rdma_ops.h"
 #include "transport/rdma_request.h"
-#if UCCL_P2P_ENABLE_NCCL
-#include "transport/nccl_ops.h"
-#endif
 #if UCCL_P2P_ENABLE_CXI
 #include "transport/cxi_ops.h"
 #endif
@@ -118,7 +115,13 @@ inline SendConnection* uccl_resolve_send_group(GenericEndpoint const& ep,
 }
 
 inline bool uccl_check_wr_fast(SendConnection* send_group, int64_t wr_id) {
+#if !UCCL_P2P_ENABLE_RDMA
+  (void)send_group;
+  (void)wr_id;
+  return false;  // no WRs can exist without a network path
+#else
   return send_group->check_completion(wr_id);
+#endif
 }
 
 inline void uccl_drive_recv(GenericEndpoint const& ep) {

@@ -56,6 +56,19 @@ RDMAEndpoint::~RDMAEndpoint() {
 // ── Initialization ───────────────────────────────────────────────────────────
 bool RDMAEndpoint::initialize_rdma_ctx_for_gpu(
     int gpu_index, std::vector<size_t> const& device_ids) {
+#if !UCCL_P2P_ENABLE_RDMA
+  // Verbs-free build: there is no RDMA stack at all. Behave exactly like the
+  // runtime IPC-only mode (UCCL_P2P_ALLOW_NO_NIC=1 on a NIC-less host):
+  // contexts stay empty, same-node IPC transfers work, and every network-path
+  // operation fails fast with a clear error.
+  (void)device_ids;
+  gpu_index_ = gpu_index;
+  UCCL_LOG(WARN)
+      << "RDMAEndpoint " << gpu_index
+      << " built without verbs support (ENABLE_RDMA=0); continuing in "
+         "IPC-only mode. Only same-node IPC transfers are available.";
+  return true;
+#else
   gpu_index_ = gpu_index;
 
   // Find all devices used by the GPU
@@ -88,8 +101,6 @@ bool RDMAEndpoint::initialize_rdma_ctx_for_gpu(
     std::string msg = "No RDMA device found for GPU " +
                       std::to_string(gpu_index) +
                       "; select one with UCCL_P2P_RDMA_DEV";
-    if (UCCL_P2P_ENABLE_NCCL)
-      msg += ", or set UCCL_P2P_TRANSPORT=nccl on hosts without RDMA NICs";
     msg += ", or set UCCL_P2P_ALLOW_NO_NIC=1 for same-node IPC-only mode";
     UCCL_LOG(ERROR) << msg;
     throw std::runtime_error(msg);
@@ -106,9 +117,11 @@ bool RDMAEndpoint::initialize_rdma_ctx_for_gpu(
               << device->name() << ")" << std::endl;
   }
   return true;
+#endif  // UCCL_P2P_ENABLE_RDMA
 }
 
 void RDMAEndpoint::initialize_contexts(std::vector<size_t> const& device_ids) {
+#if UCCL_P2P_ENABLE_RDMA
   auto& device_manager = RdmaDeviceManager::instance();
   assert(!device_ids.empty() && device_ids.size() <= kNICContextNumber);
 
@@ -154,12 +167,17 @@ void RDMAEndpoint::initialize_contexts(std::vector<size_t> const& device_ids) {
   UCCL_LOG(INFO, UCCL_RDMA)
       << "RDMAEndpoint: " << kNICContextNumber << " context slots, "
       << unique_count << " unique device(s)";
+#else
+  (void)device_ids;  // no RDMA stack in verbs-free builds
+#endif
 }
 
+#if UCCL_P2P_ENABLE_RDMA
 std::shared_ptr<RdmaContext> RDMAEndpoint::get_context_by_channel_id(
     uint32_t channel_id) const {
   return contexts_[channel_id_to_context_id(channel_id)];
 }
+#endif
 
 void RDMAEndpoint::init_compressor() {
   Compressor& compressor = Compressor::get_instance();
@@ -196,7 +214,13 @@ void RDMAEndpoint::fill_compression_meta(MetaInfoToExchange& m) const {
 // ── Accessors ────────────────────────────────────────────────────────────────
 int RDMAEndpoint::gpu_index() const { return gpu_index_; }
 
-size_t RDMAEndpoint::context_count() const { return contexts_.size(); }
+size_t RDMAEndpoint::context_count() const {
+#if UCCL_P2P_ENABLE_RDMA
+  return contexts_.size();
+#else
+  return 0;  // verbs-free build: IPC-only, no RDMA contexts
+#endif
+}
 
 std::shared_ptr<RegMemBlock> RDMAEndpoint::ack_ring() const {
   return ack_ring_;
@@ -208,6 +232,10 @@ std::shared_ptr<RegMemBlock> RDMAEndpoint::write_meta_ring() const {
 
 // ── Memory registration ──────────────────────────────────────────────────────
 bool RDMAEndpoint::reg_mem(std::shared_ptr<RegMemBlock> reg_block) {
+#if !UCCL_P2P_ENABLE_RDMA
+  // Verbs-free build: no contexts to register against; nothing to do.
+  return reg_block != nullptr;
+#else
   if (unlikely(!reg_block)) {
     UCCL_LOG(ERROR) << "Error: reg_mem called with null reg_block";
     return false;
@@ -247,9 +275,13 @@ bool RDMAEndpoint::reg_mem(std::shared_ptr<RegMemBlock> reg_block) {
   }
 
   return true;
+#endif  // UCCL_P2P_ENABLE_RDMA
 }
 
 bool RDMAEndpoint::dereg_mem(std::shared_ptr<RegMemBlock> reg_block) {
+#if !UCCL_P2P_ENABLE_RDMA
+  return reg_block != nullptr;  // nothing was ever registered
+#else
   if (unlikely(!reg_block)) {
     UCCL_LOG(ERROR) << "Error: dereg_mem called with null reg_block";
     return false;
@@ -264,6 +296,7 @@ bool RDMAEndpoint::dereg_mem(std::shared_ptr<RegMemBlock> reg_block) {
     }
   }
   return true;
+#endif  // UCCL_P2P_ENABLE_RDMA
 }
 
 void RDMAEndpoint::prepare_compress_ctx(void* const data, size_t const len,
@@ -275,6 +308,16 @@ int RDMAEndpoint::uccl_regmr(void* const data, size_t const len,
                              MRArray& mr_array,
                              std::vector<MrCacheHandleRef>& cache_refs,
                              CompressCtx compress_ctx) {
+#if !UCCL_P2P_ENABLE_RDMA
+  // Verbs-free build: prepare the compression context only. No MRs exist,
+  // so the mr_array stays zeroed (rkey/lkey lookups return 0).
+  if (unlikely(!data)) {
+    UCCL_LOG(ERROR) << "Error: uccl_regmr called with null data";
+    return -1;
+  }
+  prepare_compress_ctx(data, len, compress_ctx);
+  return 0;
+#else
   if (unlikely(!data)) {
     UCCL_LOG(ERROR) << "Error: uccl_regmr called with null data";
     return -1;
@@ -327,15 +370,20 @@ int RDMAEndpoint::uccl_regmr(void* const data, size_t const len,
   }
 
   return 0;
+#endif  // UCCL_P2P_ENABLE_RDMA
 }
 
 void RDMAEndpoint::uccl_deregmr(
     std::vector<MrCacheHandleRef> const& cache_refs) {
+#if UCCL_P2P_ENABLE_RDMA
   for (auto const& ref : cache_refs) {
     if (likely(ref.context != nullptr)) {
       ref.context->release_cached_mr(ref.entry);
     }
   }
+#else
+  (void)cache_refs;  // never populated in verbs-free builds
+#endif
 }
 
 // ── Connection setup ─────────────────────────────────────────────────────────
@@ -363,6 +411,21 @@ std::string RDMAEndpoint::get_oob_conn_key(uint64_t peer_id) {
 
 ConnID RDMAEndpoint::uccl_connect(int remote_gpuidx, std::string remote_ip,
                                   uint16_t remote_port) {
+#if !UCCL_P2P_ENABLE_RDMA
+  // Verbs-free build: no network stack exists. Fail fast before any OOB
+  // handshake so the caller sees a clean error. Callers reject
+  // peer_id == UINT64_MAX.
+  (void)remote_gpuidx;
+  (void)remote_ip;
+  (void)remote_port;
+  UCCL_LOG(ERROR)
+      << "uccl_connect: this uccl build has no RDMA support (ENABLE_RDMA=0); "
+         "network connections are unavailable. Only same-node IPC transfers "
+         "work.";
+  ConnID invalid{};
+  invalid.peer_id = UINT64_MAX;
+  return invalid;
+#else
   // IPC-only mode (no RDMA device): fail fast before any OOB handshake so the
   // caller sees a clean error and the peer never ends up waiting for channel
   // metadata that will not arrive. Callers reject peer_id == UINT64_MAX.
@@ -370,8 +433,8 @@ ConnID RDMAEndpoint::uccl_connect(int remote_gpuidx, std::string remote_ip,
     UCCL_LOG(ERROR)
         << "uccl_connect: no RDMA context on this host (no RDMA device); "
            "network connections are unavailable. Only same-node IPC "
-           "transfers work without an RDMA device; use "
-           "UCCL_P2P_TRANSPORT=nccl or soft-RoCE for network transfers.";
+           "transfers work without an RDMA device; use soft-RoCE for "
+           "network transfers.";
     ConnID invalid{};
     invalid.peer_id = UINT64_MAX;
     return invalid;
@@ -393,8 +456,10 @@ ConnID RDMAEndpoint::uccl_connect(int remote_gpuidx, std::string remote_ip,
       reinterpret_cast<void*>(static_cast<intptr_t>(current_send_peer_id));
   conn_id.peer_id = current_send_peer_id;
   return conn_id;
+#endif  // UCCL_P2P_ENABLE_RDMA
 }
 
+#if UCCL_P2P_ENABLE_RDMA
 int RDMAEndpoint::build_connect(uint64_t peer_id, bool sync, int timeout_ms) {
   std::string const oob_con = build_oob_connect(peer_id);
   uint64_t receved_peer_id =
@@ -570,6 +635,7 @@ uint64_t RDMAEndpoint::handle_send_meta_response(
   channel->establish_channel(response_meta.channel_meta);
   return response_meta.peer_id;
 }
+#endif  // UCCL_P2P_ENABLE_RDMA
 
 ConnID RDMAEndpoint::uccl_accept(std::string& remote_ip, int* remote_gpuidx) {
   AcceptedMeta accepted;
@@ -578,6 +644,21 @@ ConnID RDMAEndpoint::uccl_accept(std::string& remote_ip, int* remote_gpuidx) {
   // real connection to peer 0 (which then waits forever for channel metadata).
   uint64_t peer_id = UINT64_MAX;
 
+#if !UCCL_P2P_ENABLE_RDMA
+  // Verbs-free build: process_meta() rejects every channel request, so no
+  // network connection can ever be accepted. Just observe shutdown.
+  (void)remote_ip;
+  (void)remote_gpuidx;
+  while (!stop_accept_.load(std::memory_order_acquire)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ConnID conn_id;
+  conn_id.context = nullptr;
+  conn_id.peer_id = UINT64_MAX;
+  conn_id.sock_fd = -1;
+  conn_id.dev = 0;
+  return conn_id;
+#else
   // Block until there's an accepted connection
   while (!stop_accept_.load(std::memory_order_acquire)) {
     {
@@ -627,6 +708,7 @@ ConnID RDMAEndpoint::uccl_accept(std::string& remote_ip, int* remote_gpuidx) {
   conn_id.peer_id = peer_id;
   conn_id.sock_fd = 0;
   return conn_id;
+#endif  // UCCL_P2P_ENABLE_RDMA
 }
 
 void RDMAEndpoint::process_meta(std::string const& input, std::string& output,
@@ -660,6 +742,18 @@ void RDMAEndpoint::process_meta(std::string const& input, std::string& output,
   UCCL_LOG(INFO, UCCL_RDMA)
       << "Received from " << client_ip << ":" << client_port << " - " << meta;
 
+#if !UCCL_P2P_ENABLE_RDMA
+  // Verbs-free build: behave exactly like the runtime IPC-only rejection.
+  // (Notifications and the PID exchange were already handled above; local
+  // IPC connections still work.)
+  UCCL_LOG(ERROR)
+      << "process_meta: got a channel request from " << client_ip << ":"
+      << client_port
+      << " but this build has no RDMA support (ENABLE_RDMA=0); rejecting the "
+         "connection";
+  throw std::runtime_error(
+      "RDMA channel request on a verbs-free (IPC-only) endpoint");
+#else
   // IPC-only mode: a channel handshake below would index contexts_[...] on an
   // empty vector. Reject loudly instead of corrupting memory. (Notifications
   // were already handled above; local IPC connections still work.)
@@ -765,12 +859,14 @@ void RDMAEndpoint::process_meta(std::string const& input, std::string& output,
     output = serialize(response);
     add_one_recv_channel(actual_peer_id, meta.channel_id, new_channel);
   }
+#endif  // UCCL_P2P_ENABLE_RDMA
 }
 
 void RDMAEndpoint::stop_accept() {
   stop_accept_.store(true, std::memory_order_release);
 }
 
+#if UCCL_P2P_ENABLE_RDMA
 // ── SendConnection group registry ────────────────────────────────────────────
 std::shared_ptr<SendConnection> RDMAEndpoint::get_or_create_send_group(
     uint64_t peer_id) {
@@ -853,9 +949,16 @@ void RDMAEndpoint::set_recv_compression_peer_meta(
   auto group = get_or_create_recv_group(peer_id);
   group->set_remote_ack_ring(peer.ack_ring_meta);
 }
+#endif  // UCCL_P2P_ENABLE_RDMA
 
 // ── One-sided transfer and completion ────────────────────────────────────────
 int64_t RDMAEndpoint::write_or_read(std::shared_ptr<RDMASendRequest> req) {
+#if !UCCL_P2P_ENABLE_RDMA
+  (void)req;
+  UCCL_LOG(ERROR) << "write_or_read: no network path in this build "
+                     "(ENABLE_RDMA=0)";
+  return kSendPostError;
+#else
   uint64_t peer_id = req->to_peer_id;
   auto it = send_channel_groups_.find(peer_id);
   if (it == send_channel_groups_.end()) {
@@ -881,9 +984,16 @@ int64_t RDMAEndpoint::write_or_read(std::shared_ptr<RDMASendRequest> req) {
   }
 
   return wr_id;
+#endif  // UCCL_P2P_ENABLE_RDMA
 }
 
 void RDMAEndpoint::check_send_complete(uint64_t peer_id, int64_t wr_id) {
+#if !UCCL_P2P_ENABLE_RDMA
+  (void)peer_id;
+  (void)wr_id;
+  UCCL_LOG(ERROR) << "check_send_complete: no network path in this build "
+                     "(ENABLE_RDMA=0)";
+#else
   UCCL_LOG(INFO, UCCL_RDMA)
       << "check_send_complete - peer_id: " << peer_id << ", wr_id: " << wr_id;
 
@@ -900,9 +1010,15 @@ void RDMAEndpoint::check_send_complete(uint64_t peer_id, int64_t wr_id) {
   UCCL_LOG(INFO, UCCL_RDMA)
       << "check_send_complete - Completed for peer_id: " << peer_id
       << ", wr_id: " << wr_id;
+#endif  // UCCL_P2P_ENABLE_RDMA
 }
 
 bool RDMAEndpoint::check_send_complete_once(uint64_t peer_id, int64_t wr_id) {
+#if !UCCL_P2P_ENABLE_RDMA
+  (void)peer_id;
+  (void)wr_id;
+  return false;  // no completions can exist without a network path
+#else
   // UCCL_LOG(INFO, UCCL_RDMA) << "check_send_complete - peer_id: " << peer_id
   //           << ", wr_id: " << wr_id;
   std::shared_lock<std::shared_mutex> lock(send_channel_mutex_);
@@ -914,35 +1030,53 @@ bool RDMAEndpoint::check_send_complete_once(uint64_t peer_id, int64_t wr_id) {
 
   auto send_group = it->second;
   return send_group->check_completion(wr_id);
+#endif  // UCCL_P2P_ENABLE_RDMA
 }
 
 SendConnection* RDMAEndpoint::get_send_group_raw(uint64_t peer_id) {
+#if !UCCL_P2P_ENABLE_RDMA
+  (void)peer_id;
+  return nullptr;  // no send groups exist in verbs-free builds
+#else
   std::shared_lock<std::shared_mutex> lock(send_channel_mutex_);
   auto it = send_channel_groups_.find(peer_id);
   if (it == send_channel_groups_.end()) return nullptr;
   return it->second.get();
+#endif  // UCCL_P2P_ENABLE_RDMA
 }
 
 // ── Polling and batching ─────────────────────────────────────────────────────
 void RDMAEndpoint::recv_routine() {
+#if UCCL_P2P_ENABLE_RDMA
   std::shared_lock<std::shared_mutex> lock(recv_channel_mutex_);
   for (auto& [peer_id, recv_group] : recv_channel_groups_) {
     if (recv_group) recv_group->recv_routine();
   }
+#else
+  // No-op: no recv channels exist in verbs-free builds.
+#endif
 }
 
 void RDMAEndpoint::send_routine() {
+#if UCCL_P2P_ENABLE_RDMA
   std::shared_lock<std::shared_mutex> lock(send_channel_mutex_);
   for (auto& [peer_id, send_group] : send_channel_groups_) {
     if (send_group) send_group->send_routine();
   }
+#else
+  // No-op: no send channels exist in verbs-free builds.
+#endif
 }
 
 void RDMAEndpoint::flush_all_sends() {
+#if UCCL_P2P_ENABLE_RDMA
   std::shared_lock<std::shared_mutex> lock(send_channel_mutex_);
   for (auto& [peer_id, send_group] : send_channel_groups_) {
     if (send_group) send_group->flush_batches();
   }
+#else
+  // No-op: nothing is ever batched in verbs-free builds.
+#endif
 }
 
 void RDMAEndpoint::create_unified_p2p_socket() {}

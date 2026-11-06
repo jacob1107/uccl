@@ -12,7 +12,6 @@ MemoryAllocator::~MemoryAllocator() = default;
 std::shared_ptr<RegMemBlock> MemoryAllocator::allocate(
     size_t size, MemoryType type, std::shared_ptr<RdmaContext> const ctx) {
   void* addr = nullptr;
-  struct ibv_mr* mr = nullptr;
 
   if (type == MemoryType::GPU) {
     addr = allocate_gpu(size);
@@ -33,8 +32,9 @@ std::shared_ptr<RegMemBlock> MemoryAllocator::allocate(
   };
 
   auto block = new RegMemBlock(addr, size, type);
+#if UCCL_P2P_ENABLE_RDMA
   if (ctx) {
-    mr = ctx->reg_mem(addr, size);
+    MrHandle mr = ctx->reg_mem(addr, size);
 
     if (!mr) {
       deallocate_raw(addr, type);
@@ -42,6 +42,9 @@ std::shared_ptr<RegMemBlock> MemoryAllocator::allocate(
     }
     block->set_mr_by_context_id(ctx->get_context_id(), mr);
   }
+#else
+  (void)ctx;  // no verbs registration in verbs-free builds
+#endif
 
   return std::shared_ptr<RegMemBlock>(block, deleter);
 }

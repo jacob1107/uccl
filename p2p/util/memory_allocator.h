@@ -1,8 +1,10 @@
 #pragma once
 
 #include "common.h"
-#include "rdma_context.h"
 #include "util/gpu_rt.h"
+
+// Opaque in verbs-free builds; defined in rdma_context.h when RDMA is on.
+class RdmaContext;
 
 class MemoryAllocator {
  public:

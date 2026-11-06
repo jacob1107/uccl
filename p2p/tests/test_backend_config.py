@@ -17,7 +17,8 @@ int main() {
   static_assert(UCCL_DEVICE_HAS_DMABUF == EXPECT_DMABUF);
   assert(B::staged_network == EXPECT_STAGING);
   assert(transport_available(TransportType::RDMA));
-  assert(transport_available(TransportType::NCCL) == bool(UCCL_P2P_ENABLE_NCCL));
+  assert(transport_available(TransportType::EFA) ==
+         bool(UCCL_P2P_ENABLE_EFA && UCCL_P2P_ENABLE_RDMA));
   try {
     (void)get_transport_type();
     return EXPECT_REJECT ? 1 : 0;

@@ -14,9 +14,8 @@
 // requests in a per-channel batch instead of immediately posting them. The
 // thread must subsequently call flush_batch() (typically via
 // RDMAEndpoint::flush_all_sends()) to flush all pending work requests in a
-// single doorbell per channel.
-inline thread_local bool g_uccl_batch_post = false;
-
+// single doorbell per channel. (g_uccl_batch_post now lives in common.h so
+// verbs-free builds compile too.)
 class RDMADataChannel {
  public:
   struct RawSendRequest {

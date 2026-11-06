@@ -62,8 +62,6 @@ sudo apt install build-essential net-tools libelf-dev libibverbs-dev \
 
 To enable AWS EFA support, you can do the same as above, and specify `UCCL_P2P_TRANSPORT=efa` during runtime. 
 
-To enable GCP TCPX support, you can refer to [NIXL_plugin_readme.md](./NIXL_plugin_readme.md).
-
 To enable HPE Slingshot/CXI support, set `UCCL_P2P_TRANSPORT=cxi` at runtime:
 ```bash
 sudo apt install libfabric-dev libhwloc-dev -y
@@ -97,12 +95,32 @@ at runtime with `UCCL_P2P_TRANSPORT`. The Makefile entry points share
 | `Makefile.cnrt` | CNRT | Neuware, with network staging |
 | `Makefile.musa` | MUSA | MUSA, RDMA/IPC only, without DMA-BUF export |
 
-Optional transports can be excluded with `ENABLE_NCCL=0`, `ENABLE_CXI=0`,
-or `ENABLE_EFA=0`. Disabling NCCL/CXI also removes their sources and SDK header
-requirements; EFA shares the RDMA provider build, so its flag only disables
-runtime selection. Unsupported selections fail before device initialization.
+Optional transports can be excluded with `ENABLE_CXI=0` or `ENABLE_EFA=0`.
+Disabling CXI also removes its sources and SDK header requirements; EFA shares
+the RDMA provider build, so its flag only disables runtime selection.
+Unsupported selections fail before device initialization.
 Keep `PYTHON_CONFIG` consistent with `PYTHON` for non-default Python installs.
 Native callers use `in_python=false`; `libuccl_p2p.so` requires no `libpython`.
+
+### Verbs-free IPC-only build
+
+`ENABLE_RDMA=0` builds a p2p engine with no RDMA software dependency at all:
+no `infiniband/verbs.h`/`efadv.h` headers at compile time and no
+`libibverbs.so` (not even `dlopen`-ed) at run time. The verbs network stack
+sources are excluded, and `RDMAEndpoint` remains compiled as the IPC/OOB
+endpoint: same-node transfers (shared-memory jring, CUDA IPC, `process_vm`
+fallback) and the OOB TCP handshake/notification path work exactly as in the
+runtime IPC-only mode (`UCCL_P2P_ALLOW_NO_NIC=1` on a host without RDMA NICs).
+Every network-path operation (inter-node transfer, RDMA channel handshake)
+fails fast with a clear error instead of hanging.
+
+```bash
+ENABLE_RDMA=0 make -j          # verbs-free build (also skips libibverbs-dev)
+```
+
+Requires `ENABLE_EFA=0` (EFA is an RDMA provider). The rkey/lkey values
+exchanged in transfer descriptors are 0 and never dereferenced, so IPC
+metadata stays wire-compatible between both builds.
 
 ```python
 from uccl import p2p
@@ -147,7 +165,7 @@ torchrun --nnodes=2 --nproc_per_node=1 --node-rank=1 --master_addr=<IP addr> ben
 Notes: 
 * You may consider exporting `GLOO_SOCKET_IFNAME=xxx NCCL_SOCKET_IFNAME=xxx` if triggering Gloo connectFullMesh failure.
 * You may consider exporting `UCCL_P2P_RDMA_GID_INDEX` if your cluster requires it for NCCL to run (usually 1, or 3 in some testbed).
-* You can specify `UCCL_P2P_TRANSPORT=ib|efa|nccl|tcp|tcpx|cxi` at runtime to choose different network backends. The default is `ib` that works for NVIDIA, Broadcom, AMD, and Intel RDMA NICs.
+* You can specify `UCCL_P2P_TRANSPORT=ib|efa|cxi` at runtime to choose different network backends. The default is `ib` that works for NVIDIA, Broadcom, AMD, and Intel RDMA NICs.
 * **You must first import `torch` before importing `uccl.p2p` for AMD GPUs**, otherwise, `RuntimeError: No HIP GPUs are available` will occur. We guess this is because torch does some extra init for AMD GPUs, in order for Pybind-C++ code to work. 
 * One-sided network write is the default in `benchmark_uccl.py`; use `--mode read` for RDMA read.
 * To benchmark one-sided IPC write (GPU-to-GPU or CPU-to-GPU), `torchrun --nproc_per_node=2 benchmarks/benchmark_uccl.py --write-ipc`. Use `--device cpu --pinned` for CPU source buffers.
@@ -163,7 +181,7 @@ Notes:
 | UCCL_P2P_RDMA_TC | Traffic class in RDMA network | 104 (IB) |
 | UCCL_P2P_RDMA_DEV | RDMA devices forced to use (instead of auto-selecting based on PCIe affinity) | none (eg, `irdma-mkp0,irdma-mkp1`) |
 | UCCL_P2P_RDMA_RELAXED_ORDERING | PCIe relaxed ordering on RDMA memory registrations (`IBV_ACCESS_RELAXED_ORDERING`); set `0` to disable. Without it GPUDirect RDMA on IOMMU-remapped VMs can cap well below line rate | 1 (enabled) |
-| UCCL_P2P_TRANSPORT | Network backend to use at runtime | ib (others: efa/nccl/tcp/tcpx/cxi) |
+| UCCL_P2P_TRANSPORT | Network backend to use at runtime | ib (others: efa/cxi) |
 | UCCL_P2P_ALLOW_NO_NIC | Let the `ib` backend start on hosts with no RDMA device (IPC-only mode): same-node IPC transfers work (cross-process peers on the same GPU included, via shm IPC), host-memory targets fall back to `process_vm_writev/readv` (peer pid exchanged over OOB; GPU buffers bounce through host staging), every network-path operation (inter-node, loopback) fails fast | 0 (disabled) |
 | UCCL_CXI_DOMAIN | CXI/libfabric domain to use when `UCCL_P2P_TRANSPORT=cxi` | auto from GPU index, eg `cxi0` |
 | UCCL_CXI_DEVICE_INDEX | CXI device index used for automatic domain selection | GPU index modulo 4 |
@@ -186,24 +204,6 @@ Example:
 UCCL_P2P_COMPRESS_STRATEGY=encode torchrun --nnodes=2 --nproc_per_node=1 \
     --node-rank=0 --master_addr=<IP addr> benchmarks/benchmark_uccl.py
 ```
-
-### Running NCCL
-
-On Client:
-```bash
-NCCL_NCHANNELS_PER_NET_PEER=4 torchrun --nnodes=2 --nproc_per_node=1 --node-rank=0 --master_addr=<IP addr> benchmarks/benchmark_nccl.py
-```
-
-On Server:
-```bash
-NCCL_NCHANNELS_PER_NET_PEER=4 torchrun --nnodes=2 --nproc_per_node=1 --node-rank=1 --master_addr=<IP addr> benchmarks/benchmark_nccl.py
-```
-
-Notes: 
-* You can specify `NCCL_IB_HCA=mlx5_2:1` to control which NIC and port to use. 
-* If you see errors like `message size truncated`, it is likely caused by NCCL version mismatch. We suggest specifying `LD_PRELOAD=<path to libnccl.so.2>`. 
-* Consider tune `NCCL_IB_GID_INDEX=3` if NCCL triggers errors.
-* This also works for AMD GPUs.
 
 ### Running NIXL with UCCL backend
 

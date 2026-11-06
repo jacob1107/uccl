@@ -158,7 +158,6 @@ NB_MODULE(p2p, m) {
         info["staged_network"] = Backend::staged_network;
         nb::list transports;
         transports.append("rdma");
-        if (transport_available(TransportType::NCCL)) transports.append("nccl");
         if (transport_available(TransportType::EFA)) transports.append("efa");
         if (transport_available(TransportType::CXI)) transports.append("cxi");
         info["compiled_transports"] = transports;
@@ -394,9 +393,14 @@ NB_MODULE(p2p, m) {
                   xfer_desc.mr_id = mr_id;
                   for (size_t j = 0; j < kNICContextNumber; j++) {
                     auto mr = mhandle->mr_array.get_key_by_context_id(j);
+#if UCCL_P2P_ENABLE_RDMA
                     assert(mr != nullptr);
-                    xfer_desc.lkeys.push_back(mr->lkey);
-                    xfer_desc.rkeys.push_back(mr->rkey);
+#endif
+                    // mr is an opaque MrHandle in verbs-free builds; the
+                    // accessors return 0 there so the key vectors stay
+                    // consistently sized.
+                    xfer_desc.lkeys.push_back(mr_lkey_of(mr));
+                    xfer_desc.rkeys.push_back(mr_rkey_of(mr));
                   }
                 } else {
                   std::cerr << "[register_memory] RDMA registration "

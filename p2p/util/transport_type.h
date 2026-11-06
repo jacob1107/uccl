@@ -6,16 +6,15 @@
 #include <stdexcept>
 #include <string>
 
-enum class TransportType { RDMA, NCCL, EFA, CXI };
+enum class TransportType { RDMA, EFA, CXI };
 
 inline bool transport_available(TransportType type) {
   switch (type) {
     case TransportType::RDMA:
       return true;
-    case TransportType::NCCL:
-      return UCCL_P2P_ENABLE_NCCL;
     case TransportType::EFA:
-      return UCCL_P2P_ENABLE_EFA;
+      // EFA is an RDMA provider: it cannot exist in a verbs-free build.
+      return UCCL_P2P_ENABLE_EFA && UCCL_P2P_ENABLE_RDMA;
     case TransportType::CXI:
       return UCCL_P2P_ENABLE_CXI;
   }
@@ -33,10 +32,7 @@ inline TransportType get_transport_type() {
           " P2P supports only UCCL_P2P_TRANSPORT=rdma/ib (including IPC)");
     TransportType selected = TransportType::RDMA;
     if (env) {
-      if (std::strcmp(env, "nccl") == 0 || std::strcmp(env, "tcp") == 0 ||
-          std::strcmp(env, "tcpx") == 0)
-        selected = TransportType::NCCL;
-      else if (std::strcmp(env, "efa") == 0)
+      if (std::strcmp(env, "efa") == 0)
         selected = TransportType::EFA;
       else if (std::strcmp(env, "cxi") == 0)
         selected = TransportType::CXI;
@@ -47,9 +43,6 @@ inline TransportType get_transport_type() {
     return selected;
   }();
   return t;
-}
-inline bool is_nccl_transport() {
-  return get_transport_type() == TransportType::NCCL;
 }
 inline bool is_efa_transport() {
   return get_transport_type() == TransportType::EFA;

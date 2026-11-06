@@ -6,7 +6,6 @@
 #include "util/gpu_rt.h"
 #include "util/jring.h"
 #include <arpa/inet.h>
-#include <infiniband/verbs.h>
 #include <linux/in.h>
 #include <linux/tcp.h>
 #include <net/if.h>
@@ -1534,22 +1533,26 @@ static inline std::vector<fs::path> get_gpu_cards() {
   return gpu_cards;
 }
 
+// Enumerate RDMA NICs via sysfs instead of libibverbs so this header compiles
+// (and works) on hosts without any RDMA userspace package. Each entry under
+// /sys/class/infiniband/<name> has a "device" symlink to the PCI device -
+// exactly what ibv_get_device_list()+dev->ibdev_path used to provide. The
+// kernel creates the class directory whenever an RDMA device exists, so the
+// result matches the verbs enumeration (both are name-sorted downstream).
 static inline std::vector<std::pair<std::string, fs::path>> get_rdma_nics() {
   std::vector<std::pair<std::string, fs::path>> rdma_nics;
 
-  int num_devices = 0;
-  ibv_device** dev_list = ibv_get_device_list(&num_devices);
-  if (!dev_list) {
-    std::cerr << "Failed to get RDMA device list (is rdma-core installed?).\n";
-    return rdma_nics;
+  std::error_code ec;
+  if (!fs::exists("/sys/class/infiniband", ec)) {
+    return rdma_nics;  // no RDMA devices (or no RDMA kernel support)
   }
 
-  for (int i = 0; i < num_devices; ++i) {
-    ibv_device* dev = dev_list[i];
-    char const* dev_name = ibv_get_device_name(dev);  // e.g. "mlx5_0", "efa_0"
+  for (auto const& entry : fs::directory_iterator("/sys/class/infiniband", ec)) {
+    // e.g. "mlx5_0", "efa_0"
+    std::string dev_name = entry.path().filename().string();
 
-    // dev->ibdev_path is something like: /sys/class/infiniband/mlx5_0
-    fs::path dev_sysfs = fs::path(dev->ibdev_path) / "device";
+    // <ibdev>/device → ../..../0000:3b:00.0
+    fs::path dev_sysfs = entry.path() / "device";
 
     // Resolve symlink to get PCI path
     char link_target[PATH_MAX];
@@ -1566,17 +1569,13 @@ static inline std::vector<std::pair<std::string, fs::path>> get_rdma_nics() {
       pci_path = fs::path(link_target);
     } else {
       // Relative symlink — resolve relative to parent directory
-      pci_path = fs::canonical(dev_sysfs.parent_path() / link_target);
+      pci_path = fs::canonical(dev_sysfs.parent_path() / link_target, ec);
+      if (ec) continue;
     }
 
-    // The last component of pci_path is the full BDF: 0000:3b:00.0
-    std::string pci_bdf = pci_path.filename().string();
-
     // Store as { device_name, full_pci_path }
-    rdma_nics.emplace_back(dev_name, pci_path);
+    rdma_nics.emplace_back(std::move(dev_name), pci_path);
   }
-
-  ibv_free_device_list(dev_list);
 
   std::sort(rdma_nics.begin(), rdma_nics.end(),
             [](auto const& a, auto const& b) { return a.first < b.first; });

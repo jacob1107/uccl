@@ -43,7 +43,7 @@ struct uccl_engine {
   std::thread local_accept_thread;
   std::atomic<bool> local_accept_started{false};
   // Standalone OOB client for cross-process local notifications when the
-  // transport endpoint does not provide one (e.g. NCCL build).
+  // transport endpoint does not provide one (e.g. CXI build).
   std::shared_ptr<EpollClient> local_oob_client;
 };
 
@@ -123,7 +123,7 @@ static void deserialize_ipc_info(char const* buf, IpcTransferInfo& info) {
 }
 
 // Check UCCL_P2P_DISABLE_IPC=1 to force all transfers through the network
-// transport (RDMA or NCCL) even for intra-node peers.  Useful for CI testing.
+// transport (RDMA) even for intra-node peers.  Useful for CI testing.
 static bool ipc_disabled() {
   static bool disabled = [] {
     char const* val = std::getenv("UCCL_P2P_DISABLE_IPC");
@@ -410,7 +410,7 @@ uccl_conn_t* uccl_engine_connect(uccl_engine_t* engine, char const* ip_addr,
   // Detect intra-node connection: if the target IP matches our own IP.
   // When UCCL_P2P_DISABLE_IPC=1, treat cross-process connections as remote.
   // Same-process self-connections always use the local path (connect_local)
-  // regardless of DISABLE_IPC, since NCCL can't self-connect via network.
+  // regardless of DISABLE_IPC, since a transport can't self-connect via network.
   std::string local_ip = uccl::get_oob_ip();
   bool is_local =
       (same_process || !ipc_disabled()) && (std::string(ip_addr) == local_ip);
@@ -438,25 +438,14 @@ uccl_conn_t* uccl_engine_connect(uccl_engine_t* engine, char const* ip_addr,
   //     accept_local polls the own-BDF ring in that mode.
   //   - Remote inter-node: network (RDMA)
   //
-  // NCCL build:
-  //   - Same-process: IPC (direct ring access)
-  //   - Cross-process same-node: network (NCCL). Data still uses IPC via
-  //     NIXL ipc_bufs since conn->is_local is set true.
-  //     NOTE: same-GPU cross-process is unsupported with NCCL because
-  //     ncclCommInitPeer rejects two ranks on the same physical GPU.
-  //   - Remote inter-node: network (NCCL)
-  bool use_ipc;
-  if (!is_nccl_transport()) {
-    // Live check (not the cached flag): a remote_bdf equal to our own
-    // implies the engine is initialized, so this is accurate exactly when
-    // the third clause is reached.
-    bool ipc_only = !endpoint_has_network(engine->endpoint->get_endpoint());
-    use_ipc = is_local &&
-              (same_process ||
-               remote_bdf != engine->endpoint->get_gpu_bus_id() || ipc_only);
-  } else {
-    use_ipc = is_local && same_process;
-  }
+  // Live check (not the cached flag): a remote_bdf equal to our own
+  // implies the engine is initialized, so this is accurate exactly when
+  // the third clause is reached.
+  bool ipc_only = !endpoint_has_network(engine->endpoint->get_endpoint());
+  bool use_ipc =
+      is_local && (same_process ||
+                   remote_bdf != engine->endpoint->get_gpu_bus_id() ||
+                   ipc_only);
 
   bool ok;
   if (use_ipc) {
@@ -479,14 +468,12 @@ uccl_conn_t* uccl_engine_connect(uccl_engine_t* engine, char const* ip_addr,
       }
     }
   } else {
-    // Remote inter-node: use RDMA/NCCL network connection.
+    // Remote inter-node: use the RDMA network connection.
     ok = engine->endpoint->connect(std::string(ip_addr), 0, remote_port,
                                    conn_id);
     if (ok) {
       conn->sock_fd = engine->endpoint->get_sock_fd(conn_id);
-      if (!is_nccl_transport()) {
-        conn->oob_conn_key = engine->endpoint->get_oob_conn_key(conn_id);
-      }
+      conn->oob_conn_key = engine->endpoint->get_oob_conn_key(conn_id);
     }
   }
 
@@ -506,9 +493,7 @@ uccl_conn_t* uccl_engine_connect(uccl_engine_t* engine, char const* ip_addr,
 uccl_conn_t* uccl_engine_accept(uccl_engine_t* engine, char* ip_addr_buf,
                                 size_t ip_addr_buf_len, int* remote_gpu_idx) {
   if (!engine || !ip_addr_buf || !remote_gpu_idx) return nullptr;
-  if (!is_nccl_transport()) {
-    engine->endpoint->start_passive_accept();
-  }
+  engine->endpoint->start_passive_accept();
   uccl_conn_t* conn = new uccl_conn;
   std::string ip_addr;
   uint64_t conn_id;
@@ -522,9 +507,7 @@ uccl_conn_t* uccl_engine_accept(uccl_engine_t* engine, char* ip_addr_buf,
   *remote_gpu_idx = gpu_idx;
   conn->conn_id = conn_id;
   conn->sock_fd = engine->endpoint->get_sock_fd(conn_id);
-  if (!is_nccl_transport()) {
-    conn->oob_conn_key = engine->endpoint->get_oob_conn_key(conn_id);
-  }
+  conn->oob_conn_key = engine->endpoint->get_oob_conn_key(conn_id);
   conn->engine = engine;
   conn->listener_thread = nullptr;
   conn->listener_running = false;
@@ -595,20 +578,6 @@ int uccl_engine_read_vector(uccl_conn_t* conn, std::vector<uccl_mr_t> mr_ids,
                             uint64_t* transfer_id,
                             std::vector<char*> ipc_bufs) {
   if (!conn || num_iovs <= 0) return -1;
-
-  if (is_nccl_transport()) {
-    // The NIXL UCCL backend always uses the vector API, even for a single iov.
-    // For the NCCL path, bypass the generic readv proxy-thread machinery in
-    // that case and issue the scalar read directly.
-    if (num_iovs == 1 && mr_ids.size() == 1 && dst_v.size() == 1 &&
-        size_v.size() == 1 && fifo_items.size() == 1 && ipc_bufs.empty()) {
-      return conn->engine->endpoint->read_async(conn->conn_id, mr_ids[0],
-                                                dst_v[0], size_v[0],
-                                                fifo_items[0], transfer_id)
-                 ? 0
-                 : -1;
-    }
-  }
 
   // Local IPC path (both same-process and cross-process)
   if ((conn->is_local || conn->same_process) && !ipc_bufs.empty()) {
@@ -703,19 +672,6 @@ int uccl_engine_write_vector(uccl_conn_t* conn, std::vector<uccl_mr_t> mr_ids,
                              uint64_t* transfer_id,
                              std::vector<char*> ipc_bufs) {
   if (!conn || num_iovs <= 0) return -1;
-
-  if (is_nccl_transport()) {
-    // Mirror the single-iov fast path for writes so the merged NCCL endpoint
-    // does not force 1-buffer transfers through the vector proxy path.
-    if (num_iovs == 1 && mr_ids.size() == 1 && dst_v.size() == 1 &&
-        size_v.size() == 1 && fifo_items.size() == 1 && ipc_bufs.empty()) {
-      return conn->engine->endpoint->write_async(conn->conn_id, mr_ids[0],
-                                                 dst_v[0], size_v[0],
-                                                 fifo_items[0], transfer_id)
-                 ? 0
-                 : -1;
-    }
-  }
 
   // Local IPC path (both same-process and cross-process)
   if ((conn->is_local || conn->same_process) && !ipc_bufs.empty()) {
@@ -894,8 +850,8 @@ std::vector<notify_msg_v_t> uccl_engine_get_notifs_v() {
 }
 
 static int send_notif_impl(uccl_conn_t* conn, NotifyMsg oob_msg) {
-  // Single choke point for the frame cap: every transport (OOB TCP, NCCL
-  // control socket, CXI) sends through this function, and both the wire
+  // Single choke point for the frame cap: every transport (OOB TCP,
+  // CXI) sends through this function, and both the wire
   // header and the OOB framing prefix carry u32 lengths, so an unchecked
   // frame >4 GiB would silently wrap and desync the stream.
   size_t const frame_size =
@@ -916,7 +872,7 @@ static int send_notif_impl(uccl_conn_t* conn, NotifyMsg oob_msg) {
   }
 
   // Cross-process local connection: send via OOB client (works for both
-  // RDMA and NCCL builds).  The oob_conn_key was set up in uccl_engine_connect.
+  // RDMA and CXI builds).  The oob_conn_key was set up in uccl_engine_connect.
   if (conn->is_local && !conn->oob_conn_key.empty()) {
     auto oob_client = conn->engine->endpoint->get_oob_client();
     if (!oob_client) {
@@ -929,10 +885,6 @@ static int send_notif_impl(uccl_conn_t* conn, NotifyMsg oob_msg) {
     }
     std::string payload = serialize_notify_msg(oob_msg);
     return oob_client->send_meta(conn->oob_conn_key, payload) ? 0 : -1;
-  }
-
-  if (is_nccl_transport()) {
-    return conn->engine->endpoint->send_notification(conn->conn_id, oob_msg);
   }
 
   if (conn->oob_conn_key.empty()) {

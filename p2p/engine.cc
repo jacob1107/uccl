@@ -169,7 +169,7 @@ static inline bool is_retryable_post_failure(int rc) {
 }
 
 static inline bool is_terminal_post_failure(int rc) {
-  return rc == SendConnection::kPostError || (is_cxi_transport() && rc < 0);
+  return rc == kSendPostError || (is_cxi_transport() && rc < 0);
 }
 
 static inline bool raw_one_sided_batch_eligible(
@@ -464,8 +464,7 @@ bool Endpoint::connect(std::string ip_addr, int remote_gpu_idx, int remote_port,
   }
   ConnID uccl_conn_id = uccl_conn_id_future.get();
 
-  // RDMA connect does not populate sock_fd; only peer_id indicates rejection
-  // across transports (including NCCL protocol-version mismatches).
+  // RDMA connect does not populate sock_fd; only peer_id indicates rejection.
   if (uccl_conn_id.peer_id == UINT64_MAX) {
     return false;
   }
@@ -922,12 +921,16 @@ bool Endpoint::readv(uint64_t conn_id, std::vector<uint64_t> const& mr_id_v,
   SendConnection* send_group =
       uccl_resolve_send_group(ep_, conn->uccl_conn_id_.peer_id);
 
+#if UCCL_P2P_ENABLE_RDMA
+  // send_group is always null in verbs-free builds, so this raw-batch path is
+  // compiled out and the generic loop below fails fast on the first post.
   if (send_group != nullptr && raw_one_sided_batch_eligible(size_v, num_iovs) &&
       send_group->can_use_raw_one_sided_batch(
           SendType::Read, max_iov_bytes(size_v, num_iovs))) {
     return run_raw_one_sided_pipeline(send_group, SendType::Read, mhandle_v,
                                       dst_v, size_v, slot_item_v, num_iovs);
   }
+#endif
 
   UcclRequest ureq[kMaxInflightOps] = {};
   bool active[kMaxInflightOps] = {false};
@@ -1042,6 +1045,18 @@ bool Endpoint::run_raw_one_sided_pipeline(
     std::vector<P2PMhandle*> const& mhandle_v,
     std::vector<void*> const& local_addr_v, std::vector<size_t> const& size_v,
     std::vector<FifoItem> const& slot_item_v, size_t num_iovs) {
+#if !UCCL_P2P_ENABLE_RDMA
+  // Unreachable in verbs-free builds: callers only reach here through a
+  // non-null send group, and get_send_group_raw() always returns nullptr.
+  (void)send_group;
+  (void)send_type;
+  (void)mhandle_v;
+  (void)local_addr_v;
+  (void)size_v;
+  (void)slot_item_v;
+  (void)num_iovs;
+  return false;
+#else
   struct PendingRawWait {
     SendConnection::RawBatchWait wait;
     bool active = false;
@@ -1116,6 +1131,7 @@ bool Endpoint::run_raw_one_sided_pipeline(
   }
 
   return true;
+#endif  // UCCL_P2P_ENABLE_RDMA
 }
 
 bool Endpoint::write(uint64_t conn_id, uint64_t mr_id, void* src, size_t size,
@@ -1266,6 +1282,7 @@ bool Endpoint::writev(uint64_t conn_id, std::vector<uint64_t> const& mr_id_v,
                 << " must send exactly its registered buffer" << std::endl;
       return false;
     }
+#if UCCL_P2P_ENABLE_RDMA
     if (send_group == nullptr ||
         !send_group->will_compress_write(SendType::Write, size_v[i],
                                          mh->compress_ctx)) {
@@ -1273,14 +1290,19 @@ bool Endpoint::writev(uint64_t conn_id, std::vector<uint64_t> const& mr_id_v,
                 << " would not take the compression path" << std::endl;
       return false;
     }
+#endif
   }
 
+#if UCCL_P2P_ENABLE_RDMA
+  // send_group is always null in verbs-free builds; the generic loop below
+  // fails fast on the first post instead.
   if (send_group != nullptr && raw_one_sided_batch_eligible(size_v, num_iovs) &&
       send_group->can_use_raw_one_sided_batch(
           SendType::Write, max_iov_bytes(size_v, num_iovs))) {
     return run_raw_one_sided_pipeline(send_group, SendType::Write, mhandle_v,
                                       src_v, size_v, slot_item_v, num_iovs);
   }
+#endif
 
   UcclRequest ureq[kMaxInflightOps] = {};
   bool active[kMaxInflightOps] = {false};

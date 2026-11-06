@@ -162,7 +162,6 @@ int main() {
         engine = (ROOT / "p2p/engine.cc").read_text()
         notification = engine[engine.index("int Endpoint::send_notification") :]
         notification = notification[: notification.index("MR* Endpoint::get_mr")]
-        self.assertNotIn("is_nccl_transport", notification)
         initialization = engine[engine.index("void Endpoint::initialize_engine") :]
         self.assertNotIn("get_numa_node_from_iface", initialization)
 
@@ -178,10 +177,8 @@ int main() {
         first = first[: first.index("Endpoint::Endpoint()")]
         second = engine[engine.index("Endpoint::Endpoint()") :]
         second = second[: second.index("Endpoint::~Endpoint")]
-        self.assertNotIn("make_shared<NCCLEndpoint>", first)
         self.assertNotIn("make_shared<CxiEndpoint>", first)
         self.assertNotIn("make_shared<RDMAEndpoint>", first)
-        self.assertNotIn("make_shared<NCCLEndpoint>", second)
         self.assertNotIn("make_shared<CxiEndpoint>", second)
         self.assertNotIn("make_shared<RDMAEndpoint>", second)
 
@@ -199,9 +196,6 @@ int main() {
             None,
             "rdma",
             "ib",
-            "nccl",
-            "tcp",
-            "tcpx",
             "efa",
             "cxi",
             "typo",
@@ -225,7 +219,12 @@ int main() {
             '#include <iostream>\n#include "util/transport_type.h"\n'
             "int main() { std::cout << static_cast<int>(get_transport_type()); }"
         )
-        for name, value in (("rdma", "0"), ("nccl", "1"), ("efa", "2"), ("cxi", "3")):
+        for name, value in (
+            ("rdma", "0"),
+            ("ib", "0"),
+            ("efa", "1"),
+            ("cxi", "2"),
+        ):
             result = self.compile(
                 source, env={**os.environ, "UCCL_P2P_TRANSPORT": name}
             )
@@ -267,7 +266,6 @@ int main() {
             "-lcuda",
             "-lcudart",
             "-lamdhip64",
-            "nccl_endpoint.cc",
             "cxi_endpoint.cc",
             "mlu_staging.cc",
         ):

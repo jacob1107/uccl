@@ -37,7 +37,7 @@ static inline int set_request(std::shared_ptr<RDMAEndpoint> const& obj,
                               size_t size, FifoItem const& slot_item,
                               UcclRequest* ureq) {
   if (compress_only_send_rejected(local_mh, src, size, ureq))
-    return SendConnection::kPostError;
+    return kSendPostError;
   auto bundle = std::make_shared<PooledSendBundle>();
 
   bundle->remote_mem_obj.addr = slot_item.addr;
@@ -64,8 +64,10 @@ static inline int set_request(std::shared_ptr<RDMAEndpoint> const& obj,
 
   auto req = std::shared_ptr<RDMASendRequest>(bundle, &bundle->req);
 
+  // In verbs-free builds write_or_read() is a fail-fast stub returning
+  // kSendPostError, so this needs no extra guard.
   int64_t wr_id = obj->write_or_read(req);
-  if (wr_id == SendConnection::kPostError) return SendConnection::kPostError;
+  if (wr_id == kSendPostError) return kSendPostError;
   ureq->engine_idx = wr_id;
   ureq->peer_id = conn->uccl_conn_id_.peer_id;
   return ureq->engine_idx;
@@ -78,8 +80,23 @@ static inline int set_request_on_group(SendConnection* send_group, Conn* conn,
                                        P2PMhandle* local_mh, void* src,
                                        size_t size, FifoItem const& slot_item,
                                        UcclRequest* ureq) {
+#if !UCCL_P2P_ENABLE_RDMA
+  // No SendConnection objects exist in verbs-free builds; callers only reach
+  // here with a non-null group, which cannot happen (get_send_group_raw()
+  // returns nullptr). Fail fast like every other network path.
+  (void)send_group;
+  (void)conn;
+  (void)local_mh;
+  (void)src;
+  (void)size;
+  (void)slot_item;
+  (void)ureq;
+  UCCL_LOG(ERROR) << "set_request_on_group: no network path in this build "
+                     "(ENABLE_RDMA=0)";
+  return kSendPostError;
+#else
   if (compress_only_send_rejected(local_mh, src, size, ureq))
-    return SendConnection::kPostError;
+    return kSendPostError;
   auto bundle = std::make_shared<PooledSendBundle>();
 
   bundle->remote_mem_obj.addr = slot_item.addr;
@@ -108,10 +125,11 @@ static inline int set_request_on_group(SendConnection* send_group, Conn* conn,
   int64_t wr_id = -1;
   while (wr_id < 0) {
     wr_id = send_group->post_write_or_read(req);
-    if (wr_id == SendConnection::kPostError) return SendConnection::kPostError;
+    if (wr_id == kSendPostError) return kSendPostError;
     if (wr_id < 0) std::this_thread::sleep_for(std::chrono::microseconds(10));
   }
   ureq->engine_idx = static_cast<int>(wr_id);
   ureq->peer_id = conn->uccl_conn_id_.peer_id;
   return ureq->engine_idx;
+#endif  // UCCL_P2P_ENABLE_RDMA
 }

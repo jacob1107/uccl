@@ -2,8 +2,6 @@
 #define COMMON_H
 
 #include <arpa/inet.h>
-#include <infiniband/efadv.h>
-#include <infiniband/verbs.h>
 #include <netinet/in.h>
 #include <algorithm>
 #include <atomic>
@@ -38,6 +36,76 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+// ── RDMA (verbs) build switch ────────────────────────────────────────────────
+// ENABLE_RDMA=0 produces a verbs-free build: no <infiniband/verbs.h> at
+// compile time, no libibverbs at run time. RDMAEndpoint remains as the
+// IPC/OOB endpoint; all network paths fail fast. The aliases below keep the
+// generic data structures identical in both builds (IbvGid keeps the same
+// 16-byte wire layout; MrHandle stays an opaque pointer).
+#ifndef UCCL_P2P_ENABLE_RDMA
+#define UCCL_P2P_ENABLE_RDMA 1
+#endif
+
+#if UCCL_P2P_ENABLE_RDMA
+#include <infiniband/efadv.h>
+#include <infiniband/verbs.h>
+using MrHandle = struct ibv_mr*;
+using IbvGid = union ibv_gid;
+using IbvWcOpcode = enum ibv_wc_opcode;
+#else
+using MrHandle = void*;  // never dereferenced without verbs
+union IbvGid {
+  struct {
+    uint64_t subnet_prefix;
+    uint64_t interface_id;
+  } global;
+  uint8_t raw[16];
+};
+// Only IBV_WC_RECV_RDMA_WITH_IMM is semantically meaningful (CQMeta::has_imm).
+enum IbvWcOpcode {
+  IBV_WC_SEND,
+  IBV_WC_RDMA_WRITE,
+  IBV_WC_RDMA_READ,
+  IBV_WC_COMP,
+  IBV_WC_RECV,
+  IBV_WC_RECV_RDMA_WITH_IMM,
+};
+#endif
+
+// lkey/rkey extraction routed through one helper so the verbs-free build
+// compiles without dereferencing the opaque handle.
+inline uint32_t mr_rkey_of(MrHandle mr) {
+#if UCCL_P2P_ENABLE_RDMA
+  return mr ? mr->rkey : 0;
+#else
+  (void)mr;
+  return 0;
+#endif
+}
+
+inline uint32_t mr_lkey_of(MrHandle mr) {
+#if UCCL_P2P_ENABLE_RDMA
+  return mr ? mr->lkey : 0;
+#else
+  (void)mr;
+  return 0;
+#endif
+}
+
+// Sentinel returned by network post paths that can never succeed. Shared by
+// the generic engine code and SendConnection (rdma_connection.h).
+static constexpr int kSendPostError = -3;
+
+// Doorbell batching flag shared by the engine (BatchGuard) and the RDMA data
+// channel. Lives here so verbs-free builds compile.
+inline thread_local bool g_uccl_batch_post = false;
+
+#if !UCCL_P2P_ENABLE_RDMA
+// Placeholder so P2PMhandle / RDMAEndpoint stubs compile without verbs.
+// Never populated in a verbs-free build.
+struct MrCacheHandleRef {};
+#endif
+
 typedef uint64_t PeerID;
 struct ConnID {
   void* context;
@@ -56,8 +124,8 @@ typedef struct AcceptedMeta {
 // Notifications.
 //
 // Notification messages are variable-length. They travel over the OOB TCP
-// channel (or the NCCL control socket), both of which carry explicitly-sized
-// messages, so no fixed capacity is needed anywhere. Wire layout:
+// channel, which carries explicitly-sized messages, so no fixed capacity is
+// needed anywhere. Wire layout:
 //   u32 magic | u32 msg_type | u32 name_len | u32 msg_len | name | msg
 // (host byte order, like every other struct on these channels).
 static constexpr uint32_t NOTIFY_MSG_MAGIC = 0xDEADDEAD;
@@ -65,15 +133,19 @@ static constexpr size_t NOTIFY_MSG_HDR_SIZE = 4 * sizeof(uint32_t);
 // Sanity bound on a serialized notification frame. Enforced once on the send
 // side, in uccl_engine_send_notif, so no transport can emit a frame whose
 // length wraps the u32 header fields or the OOB framing prefix; and on the
-// receive side of the NCCL control socket, which allocates its buffer from
-// the peer-advertised length before any payload arrives, so a corrupt header
-// must not be able to trigger an arbitrarily large allocation. Generous
-// relative to real notification payloads (KBs).
+// receive side, which allocates its buffer from the peer-advertised length
+// before any payload arrives, so a corrupt header must not be able to trigger
+// an arbitrarily large allocation. Generous relative to real notification
+// payloads (KBs).
 static constexpr size_t NOTIFY_MSG_MAX_FRAME_BYTES = 64ull << 20;
 // Returned when no operation was posted, but retrying may succeed. CXI uses
 // this explicit sentinel; non-CXI paths keep the older -1 retry behavior in
 // engine.cc.
 static constexpr int UCCL_POST_TRANSIENT = -2;
+
+// NUMA node of the first active network interface (sysfs), 0 when unknown.
+// Used by transports that pin proxy threads to the NIC's node.
+int get_numa_node_from_iface();
 
 struct NotifyMsg {
   uint32_t msg_type = 0;
@@ -252,7 +324,7 @@ struct ContextArrayT {
 };
 
 using RKeyArray = ContextArrayT<uint32_t>;
-using MRArray = ContextArrayT<struct ibv_mr*>;
+using MRArray = ContextArrayT<MrHandle>;
 
 // ImmData class: encapsulates immediate data with chunk_count (high 16 bits)
 // and index (low 16 bits)
@@ -344,8 +416,8 @@ struct ChunkSplitStrategy {
 
 struct ChannelMetaData {
   uint32_t qpn;
-  union ibv_gid gid;  // RoCE
-  uint16_t lid;       // Infiniband
+  IbvGid gid;    // RoCE
+  uint16_t lid;  // Infiniband
 
   friend std::ostream& operator<<(std::ostream& os,
                                   ChannelMetaData const& meta);
@@ -370,7 +442,7 @@ struct OOBMetaData {
 
 struct CQMeta {
   uint64_t wr_id;
-  ibv_wc_opcode op_code;
+  IbvWcOpcode op_code;
   uint32_t len;
   ImmData imm;
   bool has_imm() const;
@@ -394,16 +466,16 @@ typedef struct RegMemBlock {
   bool operator==(RegMemBlock const& other) const;
 
   // Set MR by context ID
-  void set_mr_by_context_id(uint32_t context_id, struct ibv_mr* mr);
+  void set_mr_by_context_id(uint32_t context_id, MrHandle mr);
 
   // Set MR by channel ID
-  void set_mr_by_channel_id(uint32_t channel_id, struct ibv_mr* mr);
+  void set_mr_by_channel_id(uint32_t channel_id, MrHandle mr);
 
   // Get MR by channel ID
-  struct ibv_mr* get_mr_by_channel_id(uint32_t channel_id) const;
+  MrHandle get_mr_by_channel_id(uint32_t channel_id) const;
 
   // Get MR by context ID
-  struct ibv_mr* get_mr_by_context_id(uint32_t context_id) const;
+  MrHandle get_mr_by_context_id(uint32_t context_id) const;
 
   // Get rkey by channel ID (for remote RDMA access)
   uint32_t get_rkey_by_channel_id(uint32_t channel_id) const;

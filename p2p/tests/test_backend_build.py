@@ -49,8 +49,6 @@ class BackendBuildTests(unittest.TestCase):
                 if profile == "musa":
                     for forbidden in (
                         "cxi/cxi_endpoint.cc",
-                        "nccl/nccl_endpoint.cc",
-                        "-I./nccl",
                         "-I/opt/libfabric/include",
                     ):
                         self.assertNotIn(forbidden, output)
@@ -67,14 +65,28 @@ class BackendBuildTests(unittest.TestCase):
                     )
 
     def test_disabling_optional_transports_removes_their_sources(self):
-        output = self.make(ROOT / "p2p", "-n", "ENABLE_NCCL=0", "ENABLE_CXI=0", "all")
+        output = self.make(ROOT / "p2p", "-n", "ENABLE_CXI=0", "all")
         for forbidden in (
-            "nccl_endpoint.cc",
             "cxi_endpoint.cc",
             "fabric_dl.cc",
-            "nccl_dl.cc",
         ):
             self.assertNotIn(forbidden, output)
+        # A verbs-free build keeps the IPC endpoint TU but drops the whole
+        # verbs-dependent network stack and the ibv linker wraps.
+        output = self.make(
+            ROOT / "p2p", "-n", "ENABLE_RDMA=0", "ENABLE_EFA=0", "all"
+        )
+        self.assertIn("rdma_endpoint.cc", output)
+        for forbidden in (
+            "rdma_connection.cc",
+            "rdma_context.cc",
+            "ibverbs_dl.cc",
+            "efa_data_channel_impl.cc",
+            "--wrap=ibv_get_device_list",
+            "-DUCCL_P2P_ENABLE_RDMA=1",
+        ):
+            self.assertNotIn(forbidden, output)
+        self.assertIn("-DUCCL_P2P_ENABLE_RDMA=0", output)
 
     def test_native_link_does_not_require_python_embedding_libraries(self):
         with tempfile.TemporaryDirectory() as directory:

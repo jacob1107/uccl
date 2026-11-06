@@ -1,4 +1,23 @@
 #include "common.h"
+#include "util/net.h"
+#include <fstream>
+
+int get_numa_node_from_iface() {
+  char if_names[MAX_IF_NAME_SIZE] = {};
+  uccl::socketAddress if_addrs[1];
+  int n = uccl::find_interfaces(if_names, if_addrs, MAX_IF_NAME_SIZE, 1);
+  if (n <= 0) {
+    return 0;
+  }
+  std::string ifname(if_names);
+  std::string path = "/sys/class/net/" + ifname + "/device/numa_node";
+  std::ifstream file(path);
+  int numa_node = -1;
+  if (!(file >> numa_node)) {
+    return 0;
+  }
+  return numa_node < 0 ? 0 : numa_node;
+}
 
 void serialize_fifo_item(FifoItem const& item, char* buf) {
   std::memcpy(buf + 0, &item.addr, sizeof(uint64_t));
@@ -83,9 +102,8 @@ size_t ChunkSplitStrategy::get_regular_chunk_size(size_t message_size,
 void copy_rkey_array_from_mr_array(MRArray const& mr_array,
                                    RKeyArray& rkey_array) {
   for (uint32_t ctx = 0; ctx < kNICContextNumber; ++ctx) {
-    ibv_mr* mr = mr_array.get_key_by_context_id(ctx);
-    uint32_t rkey = mr ? mr->rkey : 0;
-    rkey_array.set_key_by_context_id(ctx, rkey);
+    rkey_array.set_key_by_context_id(ctx,
+                                     mr_rkey_of(mr_array.get_key_by_context_id(ctx)));
   }
 }
 
@@ -97,8 +115,7 @@ void copy_rkeys_from_mr_array_to_bytes(MRArray const& mr_array, char* dst,
   uint32_t* out = reinterpret_cast<uint32_t*>(dst);
 
   for (uint32_t ctx = 0; ctx < kNICContextNumber; ++ctx) {
-    ibv_mr* mr = mr_array.get_key_by_context_id(ctx);
-    out[ctx] = mr ? mr->rkey : 0;
+    out[ctx] = mr_rkey_of(mr_array.get_key_by_context_id(ctx));
   }
 }
 
@@ -151,40 +168,36 @@ bool RegMemBlock::operator==(RegMemBlock const& other) const {
   return addr == other.addr && size == other.size && type == other.type;
 }
 
-void RegMemBlock::set_mr_by_context_id(uint32_t context_id, struct ibv_mr* mr) {
+void RegMemBlock::set_mr_by_context_id(uint32_t context_id, MrHandle mr) {
   mr_array.set_key_by_context_id(context_id, mr);
 }
 
-void RegMemBlock::set_mr_by_channel_id(uint32_t channel_id, struct ibv_mr* mr) {
+void RegMemBlock::set_mr_by_channel_id(uint32_t channel_id, MrHandle mr) {
   mr_array.set_key_by_channel_id(channel_id, mr);
 }
 
-struct ibv_mr* RegMemBlock::get_mr_by_channel_id(uint32_t channel_id) const {
+MrHandle RegMemBlock::get_mr_by_channel_id(uint32_t channel_id) const {
   return mr_array.get_key_by_channel_id(channel_id);
 }
 
-struct ibv_mr* RegMemBlock::get_mr_by_context_id(uint32_t context_id) const {
+MrHandle RegMemBlock::get_mr_by_context_id(uint32_t context_id) const {
   return mr_array.get_key_by_context_id(context_id);
 }
 
 uint32_t RegMemBlock::get_rkey_by_channel_id(uint32_t channel_id) const {
-  struct ibv_mr* mr = get_mr_by_channel_id(channel_id);
-  return mr ? mr->rkey : 0;
+  return mr_rkey_of(get_mr_by_channel_id(channel_id));
 }
 
 uint32_t RegMemBlock::get_lkey_by_channel_id(uint32_t channel_id) const {
-  struct ibv_mr* mr = get_mr_by_channel_id(channel_id);
-  return mr ? mr->lkey : 0;
+  return mr_lkey_of(get_mr_by_channel_id(channel_id));
 }
 
 uint32_t RegMemBlock::get_rkey_by_context_id(uint32_t context_id) const {
-  struct ibv_mr* mr = get_mr_by_context_id(context_id);
-  return mr ? mr->rkey : 0;
+  return mr_rkey_of(get_mr_by_context_id(context_id));
 }
 
 uint32_t RegMemBlock::get_lkey_by_context_id(uint32_t context_id) const {
-  struct ibv_mr* mr = get_mr_by_context_id(context_id);
-  return mr ? mr->lkey : 0;
+  return mr_lkey_of(get_mr_by_context_id(context_id));
 }
 
 std::ostream& operator<<(std::ostream& os, RegMemBlock const& block) {
@@ -376,6 +389,12 @@ ssize_t try_send(int fd, char const* buf, size_t len) {
 }
 
 bool is_nic_usable(std::string const& nic_name, NicMode mode) {
+#if !UCCL_P2P_ENABLE_RDMA
+  // Verbs-free build: no libibverbs to probe the port state with.
+  (void)nic_name;
+  (void)mode;
+  return false;
+#else
   if (mode == NicMode::EFA && strncmp(nic_name.c_str(), "rdmap", 5) != 0) {
     return false;
   }
@@ -417,6 +436,7 @@ bool is_nic_usable(std::string const& nic_name, NicMode mode) {
   }
   ibv_free_device_list(dev_list);
   return usable;
+#endif  // UCCL_P2P_ENABLE_RDMA
 }
 
 namespace std {

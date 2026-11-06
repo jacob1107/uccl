@@ -19,10 +19,9 @@ struct RDMAEndpoint {
 #if defined(UCCL_USE_MUSA)
 using GenericEndpoint = std::variant<std::shared_ptr<RDMAEndpoint>>;
 #else
-struct NCCLEndpoint : RDMAEndpoint { using RDMAEndpoint::RDMAEndpoint; };
 struct CxiEndpoint : RDMAEndpoint { using RDMAEndpoint::RDMAEndpoint; };
-using GenericEndpoint = std::variant<std::shared_ptr<RDMAEndpoint>,
-    std::shared_ptr<NCCLEndpoint>, std::shared_ptr<CxiEndpoint>>;
+using GenericEndpoint =
+    std::variant<std::shared_ptr<RDMAEndpoint>, std::shared_ptr<CxiEndpoint>>;
 #endif
 """
 NUMA = r"""
@@ -48,8 +47,7 @@ int uccl_get_numa_node(GenericEndpoint const& ep, int gpu_idx) {
     return RdmaDeviceManager::instance().get_numa_node(
         RdmaDeviceManager::instance().get_best_dev_idx(gpu_idx)[0]);
 #else
-    if constexpr (std::is_same_v<T, NCCLEndpoint> ||
-                  std::is_same_v<T, CxiEndpoint>)
+    if constexpr (std::is_same_v<T, CxiEndpoint>)
       return get_numa_node_from_iface();
     else
       return RdmaDeviceManager::instance().get_numa_node(
@@ -93,9 +91,7 @@ class TransportFactoryTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             transports = (
-                ("rdma", "ib")
-                if musa
-                else ("rdma", "ib", "efa", "nccl", "tcp", "tcpx", "cxi", "unknown")
+                ("rdma", "ib") if musa else ("rdma", "ib", "efa", "cxi", "unknown")
             )
             for transport in (None, *transports):
                 with self.subTest(musa=musa, transport=transport):
@@ -121,9 +117,7 @@ int main() {
 #if defined(UCCL_USE_MUSA)
     assert(std::holds_alternative<std::shared_ptr<RDMAEndpoint>>(ep));
 #else
-    if (is_nccl_transport())
-      assert(std::holds_alternative<std::shared_ptr<NCCLEndpoint>>(ep));
-    else if (is_cxi_transport())
+    if (is_cxi_transport())
       assert(std::holds_alternative<std::shared_ptr<CxiEndpoint>>(ep));
     else
       assert(std::holds_alternative<std::shared_ptr<RDMAEndpoint>>(ep));
@@ -155,7 +149,7 @@ int main() {
             + block
             + """
   assert(engine_initialized_);
-  assert(numa_node_ == ((is_nccl_transport() || is_cxi_transport()) ? 9 : 33));
+  assert(numa_node_ == (is_cxi_transport() ? 9 : 33));
 }
 """
         )
@@ -224,7 +218,7 @@ int main() {
     assert(saved->transport.peer_id == 0);
     assert(saved->port == 1234);
   }
-  // NCCL/CXI rejection uses the invalid peer ID. Never publish a failed
+  // CXI rejection uses the invalid peer ID. Never publish a failed
   // connection, even if its socket field happens to be nonnegative.
   auto count = endpoint.conn_id_to_conn_.size();
   for (int fd : {-1, 0, 42}) {

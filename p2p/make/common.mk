@@ -4,10 +4,20 @@
 PROFILE ?= cuda
 include make/profiles/$(PROFILE).mk
 
-ENABLE_NCCL ?= 1
 ENABLE_CXI ?= 1
 ENABLE_EFA ?= 1
+# 0 builds a verbs-free IPC-only engine: no infiniband/verbs.h needed at
+# compile time and no libibverbs at run time. RDMAEndpoint stays as the
+# IPC/OOB endpoint; every network path fails fast with a clear error.
+ENABLE_RDMA ?= 1
 USE_DIETGPU ?= 0
+
+ifeq ($(ENABLE_RDMA),0)
+# EFA is an RDMA provider; it cannot exist without verbs.
+ifneq ($(ENABLE_EFA),0)
+$(error ENABLE_EFA=1 requires ENABLE_RDMA=1)
+endif
+endif
 PYTHON ?= python3
 PYTHON_CONFIG ?= $(PYTHON)-config
 PREFIX ?= /usr/local
@@ -33,11 +43,11 @@ INSTALL_DIR ?= $(shell $(PYTHON) -c "import site; print(site.getsitepackages()[0
 
 # Isolate device, optional features and Python ABI. A config stamp below also
 # invalidates objects when compilers, SDK paths or user flags change in place.
-BUILD_DIR ?= .build/$(PROFILE)/nccl$(ENABLE_NCCL)-cxi$(ENABLE_CXI)-efa$(ENABLE_EFA)-diet$(USE_DIETGPU)/$(PYEXT)
+BUILD_DIR ?= .build/$(PROFILE)/cxi$(ENABLE_CXI)-efa$(ENABLE_EFA)-rdma$(ENABLE_RDMA)-diet$(USE_DIETGPU)/$(PYEXT)
 override CPPFLAGS += -I. -I./util -I./rdma -I./rdma/providers -I../include \
   $(DEVICE_CPPFLAGS) -DUCCL_DEVICE_BACKEND_HEADER=\"util/device/$(DEVICE_BACKEND)/config.h\" \
-  -DUCCL_P2P_ENABLE_NCCL=$(ENABLE_NCCL) -DUCCL_P2P_ENABLE_CXI=$(ENABLE_CXI) \
-  -DUCCL_P2P_ENABLE_EFA=$(ENABLE_EFA) -I$(EFA_HOME)/include
+  -DUCCL_P2P_ENABLE_CXI=$(ENABLE_CXI) \
+  -DUCCL_P2P_ENABLE_EFA=$(ENABLE_EFA) -DUCCL_P2P_ENABLE_RDMA=$(ENABLE_RDMA)
 override CXXFLAGS += -O3 -std=c++17 -fPIC -MMD -MP \
   -Wno-pointer-arith -Wno-sign-compare -Wno-unused-variable
 IBV_WRAP_FLAGS := -Wl,--wrap=ibv_get_device_list \
@@ -45,7 +55,11 @@ IBV_WRAP_FLAGS := -Wl,--wrap=ibv_get_device_list \
   -Wl,--wrap=ibv_reg_dmabuf_mr -Wl,--wrap=ibv_create_cq \
   -Wl,--wrap=ibv_create_qp -Wl,--wrap=ibv_qp_to_qp_ex
 override LDLIBS += $(DEVICE_LDLIBS) -lz -lelf -lpthread -ldl
-override LDFLAGS += -shared -Wl,-Bsymbolic-functions $(IBV_WRAP_FLAGS)
+override LDFLAGS += -shared -Wl,-Bsymbolic-functions
+ifeq ($(ENABLE_RDMA),1)
+override CPPFLAGS += -I$(EFA_HOME)/include
+override LDFLAGS += $(IBV_WRAP_FLAGS)
+endif
 
 ifeq ($(USE_DIETGPU),1)
 ifneq ($(DIETGPU_SUPPORTED),1)
@@ -61,14 +75,14 @@ endif
 CORE_SOURCES := engine.cc \
   util/adaptive_sleeper.cc util/common.cc util/epoll_client.cc \
   util/epoll_server.cc util/memory_allocator.cc util/seq_num.cc \
-  rdma/compression.cc rdma/rdma_context.cc rdma/rdma_connection.cc \
+  rdma/compression.cc rdma/rdma_endpoint.cc $(DEVICE_SOURCES)
+ifeq ($(ENABLE_RDMA),1)
+# Verbs-dependent network stack (libibverbs loaded via dlopen at run time).
+CORE_SOURCES += rdma/rdma_context.cc rdma/rdma_connection.cc \
   rdma/rdma_ctrl_channel.cc rdma/rdma_data_channel.cc \
-  rdma/rdma_device.cc rdma/rdma_endpoint.cc \
+  rdma/rdma_device.cc \
   rdma/providers/efa_data_channel_impl.cc rdma/providers/ib_data_channel_impl.cc \
-  rdma/ibverbs_dl.cc rdma/efadv_dl.cc $(DEVICE_SOURCES)
-ifeq ($(ENABLE_NCCL),1)
-override CPPFLAGS += -I./nccl
-CORE_SOURCES += nccl/nccl_endpoint.cc nccl/nccl_dl.cc
+  rdma/ibverbs_dl.cc rdma/efadv_dl.cc
 endif
 ifeq ($(ENABLE_CXI),1)
 override CPPFLAGS += -I$(LIBFABRIC_HOME)/include
@@ -144,5 +158,5 @@ install-deps:
 help:
 	@echo 'Targets: all install clean test test_notify_serde test_epoll_server notif_e2e install-deps'
 	@echo 'Profiles: Makefile (CUDA), Makefile.rocm, Makefile.dtk, Makefile.therock, Makefile.cnrt, Makefile.musa'
-	@echo 'Options: ENABLE_NCCL=0|1 ENABLE_CXI=0|1 ENABLE_EFA=0|1 USE_DIETGPU=0|1'
+	@echo 'Options: ENABLE_CXI=0|1 ENABLE_EFA=0|1 ENABLE_RDMA=0|1 USE_DIETGPU=0|1'
 .PHONY: test install-deps help

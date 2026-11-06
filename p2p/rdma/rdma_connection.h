@@ -108,7 +108,7 @@ class SendConnection : public RDMAConnection {
 
   // ── One-sided transfer ─────────────────────────────────────────────────────
   // Terminal posting failure; already-posted chunks have been drained.
-  static constexpr int kPostError = -3;
+  static constexpr int kPostError = kSendPostError;
   int64_t post_write_or_read(std::shared_ptr<RDMASendRequest> req);
 
   // True iff a write of msg_size bytes with this ctx would take the

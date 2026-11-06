@@ -11,7 +11,6 @@
 #include "util/net.h"
 #include "util/shared_pool.h"
 #include "util/util.h"
-#include <infiniband/verbs.h>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +26,10 @@
 
 extern thread_local bool inside_python;
 
+// Opaque RDMA send-connection group (rdma_connection.h); null in verbs-free
+// builds, where there is no network data path.
+class SendConnection;
+
 // Use the RDMA-native request types as the common currency.
 // The transport adapters convert native request layouts as needed.
 enum ReqType { ReqRead, ReqWrite };
@@ -40,7 +43,7 @@ struct UcclRequest {
 };
 
 struct Mhandle {
-  struct ibv_mr* mr;
+  MrHandle mr;  // opaque verbs MR pointer (void* in verbs-free builds)
 };
 
 struct P2PMhandle {

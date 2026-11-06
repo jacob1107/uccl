@@ -4,15 +4,23 @@
 #include "epoll_client.h"
 #include "epoll_server.h"
 #include "memory_allocator.h"
+#if UCCL_P2P_ENABLE_RDMA
 #include "rdma_connection.h"
 #include "rdma_context.h"
 #include "rdma_device.h"
+#endif
 #include "util/debug.h"
 #include "util/gpu_rt.h"
 #include "util/net.h"
-#include <cc/link_bandwidth.h>
 #include <unordered_map>
 #include <unordered_set>
+
+// RDMAEndpoint also exists in verbs-free builds (UCCL_P2P_ENABLE_RDMA=0), where
+// it keeps its IPC/OOB roles: OOB TCP server/client, notification and PID
+// exchange, local shm-IPC connection routing, compression contexts and the
+// memory bookkeeping. Every network-path method (contexts, channels, one-sided
+// transfers) is compiled down to a fail-fast stub instead.
+class SendConnection;  // defined in rdma_connection.h (verbs builds only)
 
 class RDMAEndpoint {
  public:
@@ -34,6 +42,7 @@ class RDMAEndpoint {
   // ── Accessors ──────────────────────────────────────────────────────────────
   int gpu_index() const;
 
+  // Number of RDMA contexts; always 0 in verbs-free builds (IPC-only).
   size_t context_count() const;
 
   std::shared_ptr<RegMemBlock> ack_ring() const;
@@ -58,8 +67,6 @@ class RDMAEndpoint {
 
   ConnID uccl_accept(std::string& remote_ip, int* remote_gpuidx);
 
-  int build_connect(uint64_t peer_id, bool sync = true, int timeout_ms = 10000);
-
   void stop_accept();
 
   /* True once stop_accept() was requested. Callers waiting for accept
@@ -74,6 +81,7 @@ class RDMAEndpoint {
   void prepare_compress_ctx(void* const data, size_t const len,
                             CompressCtx compress_ctx);
 
+  // Succeeds trivially in verbs-free builds (compress ctx only, no MRs).
   int uccl_regmr(void* const data, size_t const len, MRArray& mr_array,
                  std::vector<MrCacheHandleRef>& cache_refs,
                  CompressCtx compress_ctx = nullptr);
@@ -93,6 +101,7 @@ class RDMAEndpoint {
   void fill_compression_meta(MetaInfoToExchange& m) const;
 
   // ── One-sided transfer and completion ──────────────────────────────────────
+  // kSendPostError immediately in verbs-free builds (no network path exists).
   int64_t write_or_read(std::shared_ptr<RDMASendRequest> req);
 
   void check_send_complete(uint64_t peer_id, int64_t wr_id);
@@ -101,10 +110,12 @@ class RDMAEndpoint {
 
   // Resolve the SendConnection for a peer_id once so callers can poll many
   // completions without re-acquiring the mutex + map lookup per check.
+  // Always null in verbs-free builds.
   SendConnection* get_send_group_raw(uint64_t peer_id);
 
   // ── Polling and batching ───────────────────────────────────────────────────
   // Driven by the engine proxy threads or by explicit poll calls.
+  // No-ops in verbs-free builds.
   void recv_routine();
 
   void send_routine();
@@ -113,6 +124,7 @@ class RDMAEndpoint {
   void flush_all_sends();
 
  private:
+#if UCCL_P2P_ENABLE_RDMA
   // ── Context slots ──────────────────────────────────────────────────────────
   void initialize_contexts(std::vector<size_t> const& device_ids);
 
@@ -130,10 +142,6 @@ class RDMAEndpoint {
 
   uint64_t handle_send_meta_response(std::shared_ptr<RDMADataChannel> channel,
                                      std::string const& response);
-
-  // ── Passive-side connection handshake (inbound OOB server) ─────────────────
-  void process_meta(std::string const& input, std::string& output,
-                    std::string const& client_ip, int client_port);
 
   // ── SendConnection group registry ──────────────────────────────────────────
   std::shared_ptr<SendConnection> get_or_create_send_group(uint64_t peer_id);
@@ -158,9 +166,15 @@ class RDMAEndpoint {
 
   void set_recv_compression_peer_meta(uint64_t peer_id,
                                       MetaInfoToExchange const& peer);
+#endif  // UCCL_P2P_ENABLE_RDMA
+
+  // ── Passive-side connection handshake (inbound OOB server) ─────────────────
+  void process_meta(std::string const& input, std::string& output,
+                    std::string const& client_ip, int client_port);
 
   // ── Members ────────────────────────────────────────────────────────────────
   int gpu_index_;
+#if UCCL_P2P_ENABLE_RDMA
   std::vector<std::shared_ptr<RdmaContext>> contexts_;
   mutable std::shared_mutex recv_channel_mutex_;
   std::unordered_map<uint64_t, std::shared_ptr<RecvConnection>>
@@ -168,7 +182,7 @@ class RDMAEndpoint {
   mutable std::shared_mutex send_channel_mutex_;
   std::unordered_map<uint64_t, std::shared_ptr<SendConnection>>
       send_channel_groups_;
-
+#endif
   std::unordered_map<uint64_t, std::shared_ptr<OOBMetaData>> peer_oob_meta_;
   mutable std::shared_mutex peer_oob_conn_keys_mutex_;
   std::unordered_map<uint64_t, std::string> peer_oob_conn_keys_;

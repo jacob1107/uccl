@@ -15,16 +15,10 @@ STUBS = r"""
 #include <type_traits>
 #include <variant>
 #include <vector>
+// rdma_ops.h bodies are macro-guarded; compile the verbs variant here.
+#define UCCL_P2P_ENABLE_RDMA 1
 struct NotifyMsg { int value; };
 struct RDMAEndpoint {};
-struct NCCLEndpoint {
-  int calls = 0;
-  int send_notification(uint64_t peer, NotifyMsg const& message) {
-    assert(peer == 17 && message.value == 23);
-    ++calls;
-    return 42;
-  }
-};
 struct CxiEndpoint {
   int calls = 0;
   int send_notification(uint64_t peer, NotifyMsg const& message) {
@@ -36,8 +30,8 @@ struct CxiEndpoint {
 #if defined(UCCL_USE_MUSA)
 using GenericEndpoint = std::variant<std::shared_ptr<RDMAEndpoint>>;
 #else
-using GenericEndpoint = std::variant<std::shared_ptr<RDMAEndpoint>,
-    std::shared_ptr<NCCLEndpoint>, std::shared_ptr<CxiEndpoint>>;
+using GenericEndpoint =
+    std::variant<std::shared_ptr<RDMAEndpoint>, std::shared_ptr<CxiEndpoint>>;
 #endif
 int get_numa_node_from_iface() { return 9; }
 struct RdmaDeviceManager {
@@ -57,16 +51,11 @@ int main() {
   GenericEndpoint empty_rdma = std::shared_ptr<RDMAEndpoint>{};
   assert(uccl_send_notification(empty_rdma, 17, NotifyMsg{23}) == -1);
 #if !defined(UCCL_USE_MUSA)
-  auto nccl = std::make_shared<NCCLEndpoint>();
   auto cxi = std::make_shared<CxiEndpoint>();
-  assert(uccl_get_numa_node(GenericEndpoint{nccl}, 3) == 9);
   assert(uccl_get_numa_node(GenericEndpoint{cxi}, 3) == 9);
-  assert(uccl_send_notification(GenericEndpoint{nccl}, 17, NotifyMsg{23}) == 42);
   assert(uccl_send_notification(GenericEndpoint{cxi}, 17, NotifyMsg{23}) == -7);
-  assert(nccl->calls == 1 && cxi->calls == 1);
-  GenericEndpoint empty_nccl = std::shared_ptr<NCCLEndpoint>{};
+  assert(cxi->calls == 1);
   GenericEndpoint empty_cxi = std::shared_ptr<CxiEndpoint>{};
-  assert(uccl_send_notification(empty_nccl, 17, NotifyMsg{23}) == -1);
   assert(uccl_send_notification(empty_cxi, 17, NotifyMsg{23}) == -1);
 #endif
 }
@@ -82,7 +71,6 @@ class EndpointWrapperTests(unittest.TestCase):
         adapters = "template <typename T> struct EndpointOps;\n"
         for name, typ in (
             ("rdma", "RDMAEndpoint"),
-            ("nccl", "NCCLEndpoint"),
             ("cxi", "CxiEndpoint"),
         ):
             text = (ROOT / "p2p/transport" / f"{name}_ops.h").read_text()
