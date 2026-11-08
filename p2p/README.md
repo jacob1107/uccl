@@ -182,7 +182,8 @@ Notes:
 | UCCL_P2P_RDMA_DEV | RDMA devices forced to use (instead of auto-selecting based on PCIe affinity) | none (eg, `irdma-mkp0,irdma-mkp1`) |
 | UCCL_P2P_RDMA_RELAXED_ORDERING | PCIe relaxed ordering on RDMA memory registrations (`IBV_ACCESS_RELAXED_ORDERING`); set `0` to disable. Without it GPUDirect RDMA on IOMMU-remapped VMs can cap well below line rate | 1 (enabled) |
 | UCCL_P2P_TRANSPORT | Network backend to use at runtime; unrecognized values abort at startup | ib (others: efa/cxi) |
-| UCCL_P2P_ALLOW_NO_NIC | Let the `ib` backend start on hosts with no RDMA device (IPC-only mode): same-node IPC transfers work (cross-process peers on the same GPU included, via shm IPC), host-memory targets fall back to `process_vm_writev/readv` (peer pid exchanged over OOB; GPU buffers bounce through host staging), every network-path operation (inter-node, loopback) fails fast | 0 (disabled) |
+| UCCL_P2P_ALLOW_NO_NIC | Let the `ib` backend start on hosts with no RDMA device (IPC-only mode): same-node IPC transfers work (cross-process peers on the same GPU included, via shm IPC), host-memory targets fall back to `process_vm_writev/readv` (peer pid exchanged over OOB; GPU buffers bounce through pinned double-buffered host staging, overlapped with the `process_vm` copy), every network-path operation (inter-node, loopback) fails fast | 0 (disabled) |
+| UCCL_P2P_VM_CHUNK_MB | Staging chunk size (MiB) for GPU buffers crossing the `process_vm` fallback; two chunks are pinned per issuing thread. Clamped to [1, 512] | 32 |
 | UCCL_CXI_DOMAIN | CXI/libfabric domain to use when `UCCL_P2P_TRANSPORT=cxi` | auto from GPU index, eg `cxi0` |
 | UCCL_CXI_DEVICE_INDEX | CXI device index used for automatic domain selection | GPU index modulo 4 |
 | UCCL_CXI_THREADING | libfabric threading hint for the CXI domain (`endpoint` is rejected by libfabric >= 2.x CXI) | safe |

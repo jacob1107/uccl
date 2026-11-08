@@ -143,11 +143,145 @@ static bool ipc_disabled() {
 // transfer whose REMOTE descriptor is host memory has no data path when the
 // transport has no network (empty RDMA contexts). Route those through
 // process_vm_writev/readv against the peer's pid; GPU-side buffers bounce
-// through a host staging buffer since process_vm_* require user-space
-// addresses on the local side.
+// through host staging since process_vm_* require user-space addresses on
+// the local side.
+//
+// GPU-side staging uses per-thread pinned double buffering with an async
+// copy pipeline: the copy-engine transfer of chunk k+1 overlaps the
+// process_vm_* of chunk k on the CPU. When pinned memory is unavailable the
+// code falls back to the original synchronous pageable single-buffer path.
 // ---------------------------------------------------------------------------
 
-static size_t const kVmFallbackChunk = 8ul << 20;  // 8 MiB staging chunks
+// Staging chunk size for GPU buffers crossing the process_vm fallback, in
+// bytes. Large enough to amortize the per-chunk syscall and copy-engine
+// overhead, small enough to bound the pinned footprint (two chunks per
+// issuing thread). Override with UCCL_P2P_VM_CHUNK_MB, clamped to [1, 512].
+static size_t vm_fallback_chunk() {
+  static size_t const chunk = [] {
+    size_t mb = 32;
+    if (char const* val = std::getenv("UCCL_P2P_VM_CHUNK_MB")) {
+      long parsed = std::strtol(val, nullptr, 10);
+      if (parsed >= 1) mb = static_cast<size_t>(std::min(parsed, 512L));
+    }
+    return mb << 20;
+  }();
+  return chunk;
+}
+
+// Per-thread pinned staging for the process_vm fallback: two chunk-sized
+// pinned slots plus one stream and two events. Allocated lazily on first
+// use and deliberately never freed: the footprint is bounded (two chunks
+// per issuing thread) and engines can be destroyed while benchmark threads
+// still hold their caches.
+struct VmStaging {
+  void* slots[2] = {nullptr, nullptr};
+  gpuStream_t stream = nullptr;
+  gpuEvent_t done[2] = {nullptr, nullptr};
+  int dev = -1;   // device owning stream/done
+  size_t cap = 0; // slot size in bytes
+  bool ok = true; // false after any staging failure: sync pageable fallback
+
+  void* slot(int i) const { return slots[i]; }
+
+  // Idempotent; false means pinned staging is unavailable on this host
+  // (allocation or stream/event creation failed earlier). The stream and
+  // events are recreated when the issuing thread switches devices.
+  bool ensure(int device, size_t chunk) {
+    if (!ok) return false;
+    if (slots[0] == nullptr) {
+      if (gpuMallocHost(&slots[0], chunk) != gpuSuccess ||
+          gpuMallocHost(&slots[1], chunk) != gpuSuccess) {
+        if (slots[0]) gpuFreeHost(slots[0]);
+        slots[0] = slots[1] = nullptr;
+        ok = false;
+        UCCL_LOG(WARN) << "VM fallback: pinned staging unavailable; using "
+                          "synchronous pageable staging";
+        return false;
+      }
+      cap = chunk;
+    }
+    if (dev != device) {
+      if (stream) gpuStreamDestroy(stream);
+      stream = nullptr;
+      for (int i = 0; i < 2; ++i) {
+        if (done[i]) gpuEventDestroy(done[i]);
+        done[i] = nullptr;
+      }
+      int prev = -1;
+      GPU_RT_CHECK(gpuGetDevice(&prev));
+      GPU_RT_CHECK(gpuSetDevice(device));
+      bool ready =
+          gpuStreamCreateWithFlags(&stream, gpuStreamNonBlocking) == gpuSuccess;
+      for (int i = 0; ready && i < 2; ++i)
+        ready = gpuEventCreateWithFlags(&done[i], gpuEventDisableTiming) ==
+                gpuSuccess;
+      GPU_RT_CHECK(gpuSetDevice(prev));
+      if (!ready) {
+        if (stream) gpuStreamDestroy(stream);
+        stream = nullptr;
+        ok = false;
+        UCCL_LOG(WARN) << "VM fallback: staging stream/event creation failed; "
+                          "using synchronous pageable staging";
+        return false;
+      }
+      dev = device;
+    }
+    return cap >= chunk;
+  }
+
+  // Enqueue a D2H copy filling slot i; records the slot's completion event.
+  bool stage_in(int i, void const* from, size_t n) {
+    if (gpuMemcpyAsync(slots[i], from, n, gpuMemcpyDeviceToHost, stream) !=
+        gpuSuccess) {
+      UCCL_LOG(ERROR) << "VM fallback: async D2H staging copy failed";
+      return false;
+    }
+    return record(i);
+  }
+
+  // Enqueue an H2D copy draining slot i; records the slot's completion
+  // event so the next overwrite of the slot can wait on it.
+  bool stage_out(int i, void* to, size_t n) {
+    if (gpuMemcpyAsync(to, slots[i], n, gpuMemcpyHostToDevice, stream) !=
+        gpuSuccess) {
+      UCCL_LOG(ERROR) << "VM fallback: async H2D staging copy failed";
+      return false;
+    }
+    return record(i);
+  }
+
+  // Block until the op last enqueued on slot i completed.
+  bool wait_slot(int i) {
+    if (gpuEventSynchronize(done[i]) != gpuSuccess) {
+      UCCL_LOG(ERROR) << "VM fallback: staging event wait failed";
+      return false;
+    }
+    return true;
+  }
+
+  // Block until every enqueued staging op completed.
+  bool drain() {
+    if (gpuStreamSynchronize(stream) != gpuSuccess) {
+      UCCL_LOG(ERROR) << "VM fallback: staging stream sync failed";
+      return false;
+    }
+    return true;
+  }
+
+ private:
+  bool record(int i) {
+    if (gpuEventRecord(done[i], stream) != gpuSuccess) {
+      UCCL_LOG(ERROR) << "VM fallback: staging event record failed";
+      return false;
+    }
+    return true;
+  }
+};
+
+static VmStaging& vm_staging() {
+  static thread_local VmStaging staging;
+  return staging;
+}
 
 // True when this transfer must use the process_vm fallback: local peer, the
 // remote descriptor carries no IPC handle (host memory), and the transport
@@ -301,7 +435,6 @@ static int host_vm_write_vector(uccl_conn_t* conn,
                                 int num_iovs, uint64_t* transfer_id) {
   pid_t peer = exchange_peer_pid(conn->engine, conn);
   if (peer <= 0) return -1;
-  std::vector<uint8_t> staging;
   for (int i = 0; i < num_iovs; i++) {
     void* src = src_v[i];
     size_t size = size_v[i];
@@ -314,20 +447,57 @@ static int host_vm_write_vector(uccl_conn_t* conn,
     if (src_dev < 0) {
       if (!process_vm_xfer(peer, true, src, remote, size)) return -1;
     } else {
-      staging.resize(std::min(size, kVmFallbackChunk));
       gpuSetDevice(src_dev);
-      size_t off = 0;
-      while (off < size) {
-        size_t chunk = std::min(size - off, staging.size());
-        if (gpuMemcpy(staging.data(), static_cast<char const*>(src) + off,
-                      chunk, gpuMemcpyDeviceToHost) != gpuSuccess) {
-          UCCL_LOG(ERROR) << "VM fallback: D2H staging copy failed";
-          return -1;
+      size_t const cap = vm_fallback_chunk();
+      VmStaging& st = vm_staging();
+      if (st.ensure(src_dev, cap)) {
+        // Pipelined: the D2H of chunk k+1 (copy engine) overlaps the
+        // process_vm_writev of chunk k (CPU). A slot is re-enqueued only
+        // after this thread finished consuming it (program order), and the
+        // CPU only reads a slot after waiting on its completion event.
+        size_t const n = (size + cap - 1) / cap;
+        bool pending = false;
+        int pending_slot = 0;
+        size_t pending_off = 0, pending_len = 0;
+        for (size_t k = 0; k < n; ++k) {
+          size_t const off = k * cap;
+          size_t const len = std::min(cap, size - off);
+          if (!st.stage_in(static_cast<int>(k & 1),
+                           static_cast<char const*>(src) + off, len))
+            return -1;
+          if (pending &&
+              (!st.wait_slot(pending_slot) ||
+               !process_vm_xfer(peer, true, st.slot(pending_slot),
+                                static_cast<char*>(remote) + pending_off,
+                                pending_len)))
+            return -1;
+          pending = true;
+          pending_slot = static_cast<int>(k & 1);
+          pending_off = off;
+          pending_len = len;
         }
-        if (!process_vm_xfer(peer, true, staging.data(),
-                             static_cast<char*>(remote) + off, chunk))
+        if (pending &&
+            (!st.wait_slot(pending_slot) ||
+             !process_vm_xfer(peer, true, st.slot(pending_slot),
+                              static_cast<char*>(remote) + pending_off,
+                              pending_len)))
           return -1;
-        off += chunk;
+      } else {
+        // Pinned staging unavailable: synchronous pageable single buffer.
+        std::vector<uint8_t> staging(std::min(size, cap));
+        size_t off = 0;
+        while (off < size) {
+          size_t chunk = std::min(size - off, staging.size());
+          if (gpuMemcpy(staging.data(), static_cast<char const*>(src) + off,
+                        chunk, gpuMemcpyDeviceToHost) != gpuSuccess) {
+            UCCL_LOG(ERROR) << "VM fallback: D2H staging copy failed";
+            return -1;
+          }
+          if (!process_vm_xfer(peer, true, staging.data(),
+                               static_cast<char*>(remote) + off, chunk))
+            return -1;
+          off += chunk;
+        }
       }
     }
   }
@@ -345,7 +515,6 @@ static int host_vm_read_vector(uccl_conn_t* conn,
                                int num_iovs, uint64_t* transfer_id) {
   pid_t peer = exchange_peer_pid(conn->engine, conn);
   if (peer <= 0) return -1;
-  std::vector<uint8_t> staging;
   for (int i = 0; i < num_iovs; i++) {
     void* dst = dst_v[i];
     size_t size = size_v[i];
@@ -358,20 +527,42 @@ static int host_vm_read_vector(uccl_conn_t* conn,
     if (dst_dev < 0) {
       if (!process_vm_xfer(peer, false, dst, remote, size)) return -1;
     } else {
-      staging.resize(std::min(size, kVmFallbackChunk));
       gpuSetDevice(dst_dev);
-      size_t off = 0;
-      while (off < size) {
-        size_t chunk = std::min(size - off, staging.size());
-        if (!process_vm_xfer(peer, false, staging.data(),
-                             static_cast<char*>(remote) + off, chunk))
-          return -1;
-        if (gpuMemcpy(static_cast<char*>(dst) + off, staging.data(), chunk,
-                      gpuMemcpyHostToDevice) != gpuSuccess) {
-          UCCL_LOG(ERROR) << "VM fallback: H2D staging copy failed";
-          return -1;
+      size_t const cap = vm_fallback_chunk();
+      VmStaging& st = vm_staging();
+      if (st.ensure(dst_dev, cap)) {
+        // Pipelined: the process_vm_readv filling chunk k+1 (CPU) overlaps
+        // the H2D of chunk k (copy engine). A slot is overwritten only after
+        // the H2D previously draining it completed (wait on its event).
+        size_t const n = (size + cap - 1) / cap;
+        for (size_t k = 0; k < n; ++k) {
+          size_t const off = k * cap;
+          size_t const len = std::min(cap, size - off);
+          int const s = static_cast<int>(k & 1);
+          if (k >= 2 && !st.wait_slot(s)) return -1;
+          if (!process_vm_xfer(peer, false, st.slot(s),
+                               static_cast<char*>(remote) + off, len))
+            return -1;
+          if (!st.stage_out(s, static_cast<char*>(dst) + off, len))
+            return -1;
         }
-        off += chunk;
+        if (!st.drain()) return -1;
+      } else {
+        // Pinned staging unavailable: synchronous pageable single buffer.
+        std::vector<uint8_t> staging(std::min(size, cap));
+        size_t off = 0;
+        while (off < size) {
+          size_t chunk = std::min(size - off, staging.size());
+          if (!process_vm_xfer(peer, false, staging.data(),
+                               static_cast<char*>(remote) + off, chunk))
+            return -1;
+          if (gpuMemcpy(static_cast<char*>(dst) + off, staging.data(), chunk,
+                        gpuMemcpyHostToDevice) != gpuSuccess) {
+            UCCL_LOG(ERROR) << "VM fallback: H2D staging copy failed";
+            return -1;
+          }
+          off += chunk;
+        }
       }
     }
   }
