@@ -2603,6 +2603,15 @@ void Endpoint::ipc_poller_thread_func() {
   std::deque<IpcInflightOp*> active_ops;
   alignas(16) char buf[16];
   int cur_device = -1;
+  // TEMP (main-fix): UCCL_P2P_SKIP_IPC_CLOSE=1 keeps completed IPC mappings
+  // open instead of closing them here. Used to test whether
+  // gpuIpcCloseMemHandle racing other ops' in-flight async copies corrupts
+  // DMA addressing on this platform (concurrent-transfer data corruption).
+  // Mappings then stay alive until process exit.
+  static bool const skip_ipc_close = [] {
+    char const* env = std::getenv("UCCL_P2P_SKIP_IPC_CLOSE");
+    return env && std::string(env) == "1";
+  }();
   ipc_proxy_adaptive_sleeper_.update_timer();
 
   while (!stop_.load(std::memory_order_acquire) || !active_ops.empty()) {
@@ -2634,12 +2643,14 @@ void Endpoint::ipc_poller_thread_func() {
         }
         if (op->raw_ptr != nullptr) {
           // Scalar op: single handle to close.
-          if (cur_device != op->gpu_idx) {
-            GPU_RT_CHECK(gpuSetDevice(op->gpu_idx));
-            cur_device = op->gpu_idx;
+          if (!skip_ipc_close) {
+            if (cur_device != op->gpu_idx) {
+              GPU_RT_CHECK(gpuSetDevice(op->gpu_idx));
+              cur_device = op->gpu_idx;
+            }
+            GPU_RT_CHECK(gpuIpcCloseMemHandle(op->raw_ptr));
           }
-          GPU_RT_CHECK(gpuIpcCloseMemHandle(op->raw_ptr));
-        } else {
+        } else if (!skip_ipc_close) {
           // Vectorized op: close all handles.
           for (size_t i = 0; i < op->raw_ptrs_v.size(); ++i) {
             if (op->raw_ptrs_v[i] == nullptr) continue;  // direct_addr path
