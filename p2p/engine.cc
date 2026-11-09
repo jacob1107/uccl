@@ -2666,6 +2666,12 @@ void Endpoint::ipc_poller_thread_func() {
     char const* env = std::getenv("UCCL_P2P_IPC_DEBUG");
     return env && std::string(env) == "1";
   }();
+  // Deferred IPC handle teardown: gpuIpcCloseMemHandle racing other ops'
+  // in-flight async copies corrupts DMA addressing on some CUDA-compatible
+  // runtimes, so closes are batched here and applied only once no ops are
+  // in flight (see the quiescent drain below).
+  constexpr size_t kMaxPendingIpcCloses = 256;
+  std::vector<std::pair<void*, int>> pending_closes;
   ipc_proxy_adaptive_sleeper_.update_timer();
 
   while (!stop_.load(std::memory_order_acquire) || !active_ops.empty()) {
@@ -2695,31 +2701,32 @@ void Endpoint::ipc_poller_thread_func() {
         for (auto& event : op->events) {
           GPU_RT_CHECK(gpuEventDestroy(event));
         }
-        if (op->raw_ptr != nullptr) {
-          // Scalar op: single handle to close.
-          if (!skip_ipc_close) {
-            if (cur_device != op->gpu_idx) {
-              GPU_RT_CHECK(gpuSetDevice(op->gpu_idx));
-              cur_device = op->gpu_idx;
+        // Defer handle teardown instead of closing inline: closing an IPC
+        // mapping while other ops' async copies are still in flight on the
+        // shared IPC streams corrupts DMA addressing on some
+        // CUDA-compatible runtimes (observed as concurrent-transfer data
+        // corruption: dropped tail chunk + cross-write into a completed
+        // op's buffer). Closes are batched and applied only in quiescent
+        // windows below.
+        if (!skip_ipc_close) {
+          if (op->raw_ptr != nullptr) {
+            // Scalar op: single handle to close.
+            pending_closes.emplace_back(op->raw_ptr, op->gpu_idx);
+          } else {
+            // Vectorized op: close all handles.
+            for (size_t i = 0; i < op->raw_ptrs_v.size(); ++i) {
+              if (op->raw_ptrs_v[i] == nullptr) continue;  // direct_addr
+              pending_closes.emplace_back(op->raw_ptrs_v[i],
+                                          op->gpu_idxs_v[i]);
             }
-            GPU_RT_CHECK(gpuIpcCloseMemHandle(op->raw_ptr));
-          }
-        } else if (!skip_ipc_close) {
-          // Vectorized op: close all handles.
-          for (size_t i = 0; i < op->raw_ptrs_v.size(); ++i) {
-            if (op->raw_ptrs_v[i] == nullptr) continue;  // direct_addr path
-            if (cur_device != op->gpu_idxs_v[i]) {
-              GPU_RT_CHECK(gpuSetDevice(op->gpu_idxs_v[i]));
-              cur_device = op->gpu_idxs_v[i];
-            }
-            GPU_RT_CHECK(gpuIpcCloseMemHandle(op->raw_ptrs_v[i]));
           }
         }
         if (ipc_dbg) {
           std::cerr << "[IPCDBG] DONE op=0x" << std::hex
                     << reinterpret_cast<uintptr_t>(op) << std::dec
                     << " nev=" << op->events.size()
-                    << " nraw=" << op->raw_ptrs_v.size() << std::endl;
+                    << " nraw=" << op->raw_ptrs_v.size()
+                    << " pending_close=" << pending_closes.size() << std::endl;
         }
         op->status->done.store(true, std::memory_order_release);
         delete op;
@@ -2728,7 +2735,38 @@ void Endpoint::ipc_poller_thread_func() {
         ++it;
       }
     }
+
+    // Quiescent window: nothing in flight -> safe to tear down mappings.
+    // The size cap bounds growth under a continuous stream of overlapping
+    // ops; hitting it can still race on affected runtimes, so keep it high.
+    if (!pending_closes.empty() &&
+        (active_ops.empty() ||
+         pending_closes.size() >= kMaxPendingIpcCloses ||
+         stop_.load(std::memory_order_acquire))) {
+      for (auto const& close : pending_closes) {
+        if (cur_device != close.second) {
+          GPU_RT_CHECK(gpuSetDevice(close.second));
+          cur_device = close.second;
+        }
+        GPU_RT_CHECK(gpuIpcCloseMemHandle(close.first));
+      }
+      if (ipc_dbg) {
+        std::cerr << "[IPCDBG] CLOSE batch=" << pending_closes.size()
+                  << std::endl;
+      }
+      pending_closes.clear();
+    }
   }
+
+  // Final drain on shutdown.
+  for (auto const& close : pending_closes) {
+    if (cur_device != close.second) {
+      GPU_RT_CHECK(gpuSetDevice(close.second));
+      cur_device = close.second;
+    }
+    GPU_RT_CHECK(gpuIpcCloseMemHandle(close.first));
+  }
+  pending_closes.clear();
 }
 
 std::shared_ptr<UnifiedTask> Endpoint::create_task(uint64_t conn_id,
