@@ -51,7 +51,39 @@ struct uccl_conn {
   std::mutex listener_mutex;
   bool is_local = false;      // True for intra-node (IPC) connections
   bool same_process = false;  // True for same-process local transfers
+  // Peer address, used to lazily create a loopback RDMA connection when a
+  // local (IPC) connection needs the network path (e.g. host-memory buffers).
+  std::string remote_ip;
+  int remote_port = 0;
+  uint64_t rdma_loopback_conn_id = UINT64_MAX;  // Lazy loopback RDMA conn
+  std::mutex loopback_mu;
 };
+
+// Local (IPC) connections carry no RDMA channels. When a transfer needs the
+// network path on such a connection (e.g. host-memory buffers that cannot be
+// CUDA-IPC'd), lazily establish a loopback RDMA connection to the peer's
+// unified P2P socket and route the transfer through it. Mirrors the
+// host-memory fallback in engine_api.cc (Conn::rdma_loopback_conn_id_).
+// Returns the loopback conn_id, or UINT64_MAX on failure.
+static uint64_t get_rdma_loopback_conn(uccl_conn_t* conn) {
+  std::lock_guard<std::mutex> lock(conn->loopback_mu);
+  if (conn->rdma_loopback_conn_id == UINT64_MAX) {
+    uint64_t loopback_conn_id = 0;
+    if (!conn->engine->endpoint->connect(conn->remote_ip, 0,
+                                         conn->remote_port,
+                                         loopback_conn_id)) {
+      std::cerr << "[uccl_engine] loopback RDMA connect to "
+                << conn->remote_ip << ":" << conn->remote_port << " failed"
+                << std::endl;
+      return UINT64_MAX;
+    }
+    std::cerr << "[uccl_engine] created loopback RDMA conn " << loopback_conn_id
+              << " -> " << conn->remote_ip << ":" << conn->remote_port
+              << std::endl;
+    conn->rdma_loopback_conn_id = loopback_conn_id;
+  }
+  return conn->rdma_loopback_conn_id;
+}
 
 typedef struct {
   FifoItem fifo_item;
@@ -237,6 +269,8 @@ uccl_conn_t* uccl_engine_connect(uccl_engine_t* engine, char const* ip_addr,
   conn->conn_id = conn_id;
   conn->engine = engine;
   conn->is_local = is_local;
+  conn->remote_ip = ip_addr;
+  conn->remote_port = remote_port;
   conn->same_process = same_process;
   conn->listener_thread = nullptr;
   conn->listener_running = false;
@@ -365,8 +399,16 @@ int uccl_engine_read_vector(uccl_conn_t* conn, std::vector<uccl_mr_t> mr_ids,
                : -1;
   }
 
-  // Remote RDMA
-  return conn->engine->endpoint->readv_async(conn->conn_id, mr_ids, dst_v,
+  // Remote RDMA. A local (IPC) connection carries no RDMA channels; when IPC
+  // buffers are absent (e.g. host-memory descriptors that cannot be
+  // CUDA-IPC'd), route through a lazily-created loopback RDMA connection
+  // instead of crashing the send proxy ("Send channel group not found").
+  uint64_t cid = conn->conn_id;
+  if (conn->is_local && ipc_bufs.empty()) {
+    cid = get_rdma_loopback_conn(conn);
+    if (cid == UINT64_MAX) return -1;
+  }
+  return conn->engine->endpoint->readv_async(cid, mr_ids, dst_v,
                                              size_v, fifo_items, num_iovs,
                                              transfer_id)
              ? 0
@@ -467,8 +509,16 @@ int uccl_engine_write_vector(uccl_conn_t* conn, std::vector<uccl_mr_t> mr_ids,
                : -1;
   }
 
-  // Remote RDMA
-  return conn->engine->endpoint->writev_async(conn->conn_id, mr_ids, dst_v,
+  // Remote RDMA. A local (IPC) connection carries no RDMA channels; when IPC
+  // buffers are absent (e.g. host-memory descriptors that cannot be
+  // CUDA-IPC'd), route through a lazily-created loopback RDMA connection
+  // instead of crashing the send proxy ("Send channel group not found").
+  uint64_t cid = conn->conn_id;
+  if (conn->is_local && ipc_bufs.empty()) {
+    cid = get_rdma_loopback_conn(conn);
+    if (cid == UINT64_MAX) return -1;
+  }
+  return conn->engine->endpoint->writev_async(cid, mr_ids, dst_v,
                                               size_v, fifo_items, num_iovs,
                                               transfer_id)
              ? 0
@@ -555,6 +605,13 @@ void uccl_engine_stop_accept(uccl_engine_t* engine) {
 
 void uccl_engine_conn_destroy(uccl_conn_t* conn) {
   if (conn) {
+    // Tear down the lazily-created loopback RDMA connection, if any, before
+    // freeing the uccl_conn itself.
+    if (conn->rdma_loopback_conn_id != UINT64_MAX) {
+      conn->engine->endpoint->remove_remote_endpoint(
+          conn->rdma_loopback_conn_id);
+      conn->rdma_loopback_conn_id = UINT64_MAX;
+    }
     uccl_engine_stop_listener(conn);
     delete conn;
   }
