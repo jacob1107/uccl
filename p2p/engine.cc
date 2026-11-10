@@ -2030,10 +2030,6 @@ bool Endpoint::writev_ipc_async(uint64_t conn_id,
                                         info_v[iov].offset);
     }
 
-    static bool const ipc_dbg = [] {
-      char const* env = std::getenv("UCCL_P2P_IPC_DEBUG");
-      return env && std::string(env) == "1";
-    }();
     bool is_host = (uccl::get_dev_idx(const_cast<void*>(data_v[iov])) == -1);
     auto memcpy_kind =
         is_host ? gpuMemcpyHostToDevice : gpuMemcpyDeviceToDevice;
@@ -2043,31 +2039,12 @@ bool Endpoint::writev_ipc_async(uint64_t conn_id,
         streams.size(), sz < kIpcSizePerEngine ? 1 : sz / kIpcSizePerEngine);
     size_t chunk_size = sz / num_streams;
 
-    if (ipc_dbg) {
-      std::cerr << "[IPCDBG] W conn=" << conn_id << " iov=" << iov
-                << " src=0x" << std::hex
-                << reinterpret_cast<uintptr_t>(data_v[iov]) << " dst=0x"
-                << reinterpret_cast<uintptr_t>(dst_ptr) << " direct=0x"
-                << info_v[iov].direct_addr << std::dec
-                << " off=" << info_v[iov].offset << " sz=" << sz
-                << " nstr=" << num_streams << " chunk=" << chunk_size
-                << std::endl;
-    }
-
     for (int i = 0; i < num_streams; ++i) {
       void* chunk_src = reinterpret_cast<void*>(
           reinterpret_cast<uintptr_t>(data_v[iov]) + i * chunk_size);
       void* chunk_dst = reinterpret_cast<void*>(
           reinterpret_cast<uintptr_t>(dst_ptr) + i * chunk_size);
       auto copy_size = i == num_streams - 1 ? sz - i * chunk_size : chunk_size;
-      if (ipc_dbg) {
-        std::cerr << "[IPCDBG] W chunk iov=" << iov << " i=" << i
-                  << " dst=0x" << std::hex
-                  << reinterpret_cast<uintptr_t>(chunk_dst) << " src=0x"
-                  << reinterpret_cast<uintptr_t>(chunk_src) << std::dec
-                  << " len=" << copy_size << " stream=0x"
-                  << reinterpret_cast<uintptr_t>(streams[i]) << std::endl;
-      }
       GPU_RT_CHECK(uccl::device::ipc_copy_async(
           chunk_dst, target_gpu, chunk_src, local_gpu_idx_, copy_size, is_host,
           memcpy_kind, streams[i]));
@@ -2161,10 +2138,6 @@ bool Endpoint::readv_ipc_async(uint64_t conn_id, std::vector<void*> data_v,
                                         info_v[iov].offset);
     }
 
-    static bool const ipc_dbg = [] {
-      char const* env = std::getenv("UCCL_P2P_IPC_DEBUG");
-      return env && std::string(env) == "1";
-    }();
     bool is_host = (uccl::get_dev_idx(data_v[iov]) == -1);
     auto memcpy_kind =
         is_host ? gpuMemcpyDeviceToHost : gpuMemcpyDeviceToDevice;
@@ -2174,31 +2147,12 @@ bool Endpoint::readv_ipc_async(uint64_t conn_id, std::vector<void*> data_v,
         streams.size(), sz < kIpcSizePerEngine ? 1 : sz / kIpcSizePerEngine);
     size_t chunk_size = sz / num_streams;
 
-    if (ipc_dbg) {
-      std::cerr << "[IPCDBG] R conn=" << conn_id << " iov=" << iov
-                << " dst=0x" << std::hex
-                << reinterpret_cast<uintptr_t>(data_v[iov]) << " src=0x"
-                << reinterpret_cast<uintptr_t>(src_ptr) << " direct=0x"
-                << info_v[iov].direct_addr << std::dec
-                << " off=" << info_v[iov].offset << " sz=" << sz
-                << " nstr=" << num_streams << " chunk=" << chunk_size
-                << std::endl;
-    }
-
     for (int i = 0; i < num_streams; ++i) {
       void* chunk_src = reinterpret_cast<void*>(
           reinterpret_cast<uintptr_t>(src_ptr) + i * chunk_size);
       void* chunk_dst = reinterpret_cast<void*>(
           reinterpret_cast<uintptr_t>(data_v[iov]) + i * chunk_size);
       auto copy_size = i == num_streams - 1 ? sz - i * chunk_size : chunk_size;
-      if (ipc_dbg) {
-        std::cerr << "[IPCDBG] R chunk iov=" << iov << " i=" << i
-                  << " src=0x" << std::hex
-                  << reinterpret_cast<uintptr_t>(chunk_src) << " dst=0x"
-                  << reinterpret_cast<uintptr_t>(chunk_dst) << std::dec
-                  << " len=" << copy_size << " stream=0x"
-                  << reinterpret_cast<uintptr_t>(streams[i]) << std::endl;
-      }
       GPU_RT_CHECK(uccl::device::ipc_copy_async(
           chunk_dst, local_gpu_idx_, chunk_src, target_gpu, copy_size, is_host,
           memcpy_kind, streams[i]));
@@ -2649,23 +2603,6 @@ void Endpoint::ipc_poller_thread_func() {
   std::deque<IpcInflightOp*> active_ops;
   alignas(16) char buf[16];
   int cur_device = -1;
-  // TEMP (main-fix): UCCL_P2P_SKIP_IPC_CLOSE=1 keeps completed IPC mappings
-  // open instead of closing them here. Used to test whether
-  // gpuIpcCloseMemHandle racing other ops' in-flight async copies corrupts
-  // DMA addressing on this platform (concurrent-transfer data corruption).
-  // Mappings then stay alive until process exit.
-  static bool const skip_ipc_close = [] {
-    char const* env = std::getenv("UCCL_P2P_SKIP_IPC_CLOSE");
-    return env && std::string(env) == "1";
-  }();
-  if (skip_ipc_close) {
-    std::cerr << "[UCCL P2P] UCCL_P2P_SKIP_IPC_CLOSE=1 active: completed IPC"
-              << " mappings are NOT closed (test mode)" << std::endl;
-  }
-  static bool const ipc_dbg = [] {
-    char const* env = std::getenv("UCCL_P2P_IPC_DEBUG");
-    return env && std::string(env) == "1";
-  }();
   // Deferred IPC handle teardown: gpuIpcCloseMemHandle racing other ops'
   // in-flight async copies corrupts DMA addressing on some CUDA-compatible
   // runtimes, so closes are batched here and applied only once no ops are
@@ -2708,25 +2645,15 @@ void Endpoint::ipc_poller_thread_func() {
         // corruption: dropped tail chunk + cross-write into a completed
         // op's buffer). Closes are batched and applied only in quiescent
         // windows below.
-        if (!skip_ipc_close) {
-          if (op->raw_ptr != nullptr) {
-            // Scalar op: single handle to close.
-            pending_closes.emplace_back(op->raw_ptr, op->gpu_idx);
-          } else {
-            // Vectorized op: close all handles.
-            for (size_t i = 0; i < op->raw_ptrs_v.size(); ++i) {
-              if (op->raw_ptrs_v[i] == nullptr) continue;  // direct_addr
-              pending_closes.emplace_back(op->raw_ptrs_v[i],
-                                          op->gpu_idxs_v[i]);
-            }
+        if (op->raw_ptr != nullptr) {
+          // Scalar op: single handle to close.
+          pending_closes.emplace_back(op->raw_ptr, op->gpu_idx);
+        } else {
+          // Vectorized op: close all handles.
+          for (size_t i = 0; i < op->raw_ptrs_v.size(); ++i) {
+            if (op->raw_ptrs_v[i] == nullptr) continue;  // direct_addr
+            pending_closes.emplace_back(op->raw_ptrs_v[i], op->gpu_idxs_v[i]);
           }
-        }
-        if (ipc_dbg) {
-          std::cerr << "[IPCDBG] DONE op=0x" << std::hex
-                    << reinterpret_cast<uintptr_t>(op) << std::dec
-                    << " nev=" << op->events.size()
-                    << " nraw=" << op->raw_ptrs_v.size()
-                    << " pending_close=" << pending_closes.size() << std::endl;
         }
         op->status->done.store(true, std::memory_order_release);
         delete op;
@@ -2749,10 +2676,6 @@ void Endpoint::ipc_poller_thread_func() {
           cur_device = close.second;
         }
         GPU_RT_CHECK(gpuIpcCloseMemHandle(close.first));
-      }
-      if (ipc_dbg) {
-        std::cerr << "[IPCDBG] CLOSE batch=" << pending_closes.size()
-                  << std::endl;
       }
       pending_closes.clear();
     }
