@@ -73,6 +73,9 @@ typedef struct {
   size_t size;
   IpcTransferInfo ipc_info = {};  // Pre-computed IPC handle for GPU buffers
   bool has_ipc = false;           // True if IPC handle is valid (GPU memory)
+  bool host_pinned = false;       // True if we pinned this host range on reg
+  uintptr_t pin_base = 0;         // Page-rounded base passed to gpuHostRegister
+  size_t pin_size = 0;            // Page-rounded length passed to gpuHostRegister
 } mem_reg_entry_t;
 
 std::unordered_map<uintptr_t, mem_reg_entry_t> mem_reg_info;
@@ -379,6 +382,21 @@ static int host_vm_read_vector(uccl_conn_t* conn,
   return 0;
 }
 
+#if defined(gpuHostRegister)
+// Check UCCL_P2P_PIN_HOST_MEM=0 to skip pinning host buffers on register.
+static bool host_pin_disabled() {
+  static bool disabled = [] {
+    char const* val = std::getenv("UCCL_P2P_PIN_HOST_MEM");
+    bool dis = val && std::string(val) == "0";
+    if (dis)
+      std::cerr << "UCCL P2P: host-memory pinning on register disabled"
+                << std::endl;
+    return dis;
+  }();
+  return disabled;
+}
+#endif
+
 uccl_engine_t* uccl_engine_create(int num_cpus, bool in_python) {
   try {
     (void)get_transport_type();
@@ -542,6 +560,34 @@ int uccl_engine_reg(uccl_engine_t* engine, uintptr_t data, size_t size,
       entry.has_ipc = true;
     }
   }
+#if defined(gpuHostRegister)
+  else if (!host_pin_disabled()) {
+    // Host buffer: pin it so the local (IPC) path's cudaMemcpyAsync DMAs
+    // directly instead of taking the driver's staged bounce-buffer copy
+    // (a few GB/s with the CPU in the loop).  Same pin-on-register approach
+    // UCX/NCCL use.  Failure (e.g. RLIMIT_MEMLOCK) is non-fatal: we keep the
+    // pageable behavior and only lose the fast path.
+    long const ps = sysconf(_SC_PAGESIZE);
+    uintptr_t const page = ps > 0 ? static_cast<uintptr_t>(ps) : 4096;
+    uintptr_t const pin_base = data & ~(page - 1);
+    uintptr_t const pin_end = (data + size + page - 1) & ~(page - 1);
+    gpuError_t err =
+        gpuHostRegister(reinterpret_cast<void*>(pin_base), pin_end - pin_base,
+                        gpuHostRegisterPortable);
+    if (err == gpuSuccess) {
+      entry.host_pinned = true;
+      entry.pin_base = pin_base;
+      entry.pin_size = pin_end - pin_base;
+    } else if (err != gpuErrorHostMemoryAlreadyRegistered) {
+      std::cerr << "UCCL P2P: gpuHostRegister failed for host buffer [0x"
+                << std::hex << data << ", +" << std::dec << size
+                << "]: " << gpuGetErrorString(err)
+                << " (transfers from/to this buffer stay on the slow staged "
+                   "path; check `ulimit -l` / RLIMIT_MEMLOCK)"
+                << std::endl;
+    }
+  }
+#endif
 
   mem_reg_info[data] = entry;
   return 0;
@@ -791,6 +837,10 @@ void uccl_engine_conn_destroy(uccl_conn_t* conn) {
 void uccl_engine_mr_destroy(uccl_engine_t* engine, uccl_mr_t mr) {
   for (auto it = mem_reg_info.begin(); it != mem_reg_info.end(); ++it) {
     if (it->second.mr_id == mr) {
+#if defined(gpuHostRegister)
+      if (it->second.host_pinned)
+        gpuHostUnregister(reinterpret_cast<void*>(it->second.pin_base));
+#endif
       engine->endpoint->dereg(mr);
       mem_reg_info.erase(it);
       break;

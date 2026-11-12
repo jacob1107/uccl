@@ -34,6 +34,10 @@
 #define gpuHostMalloc cudaMallocHost  // no cudaHostMalloc API in CUDA
 #define gpuHostAlloc cudaHostAlloc
 #define gpuHostAllocMapped cudaHostAllocMapped
+#define gpuHostRegister cudaHostRegister
+#define gpuHostUnregister cudaHostUnregister
+#define gpuHostRegisterPortable cudaHostRegisterPortable
+#define gpuErrorHostMemoryAlreadyRegistered cudaErrorHostMemoryAlreadyRegistered
 #define gpuMalloc cudaMalloc
 #define gpuMallocAsync cudaMallocAsync
 #define gpuMallocHost cudaMallocHost
